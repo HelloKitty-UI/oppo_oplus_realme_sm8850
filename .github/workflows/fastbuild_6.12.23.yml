@@ -670,19 +670,31 @@ jobs:
       - name: 专门编译并提取 hid-microsoft.ko 模块
         run: |
           WORKDIR="$(pwd)"
+          # 进入内核源码根目录
           cd kernel_workspace/common
-          # 这一步非常重要：确保使用和你构建内核时相同的 Clang 工具链路径
+          
+          # 重新设置路径和环境变量
           export PATH="$WORKDIR/kernel_workspace/clang19/bin:$WORKDIR/kernel_workspace/build-tools/bin:$PATH"
+          export LLVM=1 LLVM_IAS=1 ARCH=arm64
           
-          # 准备模块构建环境（依赖内核构建产出的 out 目录）
-          make -j$(nproc --all) O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 modules_prepare
+          echo ">>> 开始准备模块构建环境..."
+          # 必须带上 O=out 否则找不到之前内核编译生成的 .config
+          make -j$(nproc --all) O=out modules_prepare
           
-          # 只编译 hid-microsoft 所在的目录，速度非常快
-          make -j$(nproc --all) O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 M=drivers/hid modules
+          echo ">>> 正在定向编译驱动模块..."
+          # 关键修改：明确指定源码位置 (-C) 和 输出位置 (O=out)
+          # M 必须是指向源码树中包含 Makefile 的目录
+          make -j$(nproc --all) O=out M=drivers/hid modules
           
-          # 将成品 .ko 拷贝出来，方便后续上传步骤识别
-          cp out/drivers/hid/hid-microsoft.ko ../../hid-microsoft-fixed.ko
-
+          # 检查并提取
+          if [ -f "out/drivers/hid/hid-microsoft.ko" ]; then
+            cp out/drivers/hid/hid-microsoft.ko ../../hid-microsoft-fixed.ko
+            echo ">>> 模块提取成功: hid-microsoft-fixed.ko"
+          else
+            echo ">>> 错误: 未能生成 .ko 文件，请检查 drivers/hid/ 目录下的 Makefile 配置"
+            ls -R out/drivers/hid/ || true
+            exit 1
+          fi
 
       - name: 保存新的 ccache 缓存
         if: inputs.ccache_update || steps.ccache-restore.outputs.cache-hit != 'true'

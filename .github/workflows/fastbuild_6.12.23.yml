@@ -542,45 +542,41 @@ jobs:
         run: |
           WORKDIR="$(pwd)"
           COMMON_SRC="$WORKDIR/kernel_workspace/common"
+          cd "$COMMON_SRC"
           
           # 1. 设置环境变量
           export PATH="$WORKDIR/kernel_workspace/clang19/bin:$WORKDIR/kernel_workspace/build-tools/bin:$PATH"
           export LLVM=1 LLVM_IAS=1 ARCH=arm64
           export CROSS_COMPILE=aarch64-linux-gnu-
           
-          # 2. 确保配置存在
-          cd "$COMMON_SRC"
-          if [ ! -f "out/.config" ]; then
-            echo ">>> 重新生成配置..."
-            make O=out vendor/sm8850_defconfig || make O=out gki_defconfig
-          fi
+          # 2. 确保配置生成在 out 目录 (此时在 common 目录)
+          echo ">>> 正在生成基础配置..."
+          # 尝试多种可能的 defconfig 路径
+          make O=out gki_defconfig
           
-          # 3. 核心修复：直接进入驱动所在目录进行强制编译
-          echo ">>> 切换到驱动目录执行强编..."
-          cd drivers/hid
+          # 3. 强制开启 HID_MICROSOFT 编译选项 (确保它被编译成模块)
+          echo ">>> 强制开启微软手柄模块配置..."
+          sed -i 's/CONFIG_HID_MICROSOFT=y/CONFIG_HID_MICROSOFT=m/g' out/.config
+          echo "CONFIG_HID_MICROSOFT=m" >> out/.config
           
-          # 直接调用顶层 Makefile 来编译当前目录下的对象
-          # 我们不再使用 M= 参数，而是让构建系统认为我们要编译这个文件夹里的目标
-          make -j$(nproc --all) -C ../../ O=../../out $(pwd)/hid-microsoft.o
+          # 4. 执行模块编译环境准备
+          make -j$(nproc --all) O=out modules_prepare
           
-          # 4. 手动链接成 .ko (如果上面的命令只出了 .o)
-          # 通常上面的命令会自动触发生成 .ko，我们去 out 目录找
-          echo ">>> 正在搜索生成的驱动文件..."
-          find ../../out/drivers/hid -name "hid-microsoft.ko" -exec cp {} ../../../hid-microsoft-fixed.ko \;
+          # 5. 【核心修复】直接在根目录指定目标文件夹编译
+          # 这种写法会自动处理所有 Makefile 依赖，且 O=out 路径保持一致
+          echo ">>> 开始定向编译模块..."
+          make -j$(nproc --all) O=out M=drivers/hid modules
           
-          # 5. 最终检查
-          if [ -f "../../../hid-microsoft-fixed.ko" ]; then
-            echo ">>> 成功提取: hid-microsoft-fixed.ko"
+          # 6. 提取产物
+          echo ">>> 正在搜索并提取 .ko 文件..."
+          find out/drivers/hid -name "hid-microsoft.ko" -exec cp {} ../../hid-microsoft-fixed.ko \;
+          
+          # 7. 最终校验
+          if [ -f "../../hid-microsoft-fixed.ko" ]; then
+            echo ">>> 模块提取成功！"
           else
-            echo ">>> 尝试备用方案：编译整个文件夹..."
-            cd "$COMMON_SRC"
-            make -j$(nproc --all) O=out drivers/hid/
-            find out/drivers/hid -name "hid-microsoft.ko" -exec cp {} ../../hid-microsoft-fixed.ko \;
-          fi
-
-          if [ ! -f "../../hid-microsoft-fixed.ko" ]; then
-            echo ">>> 依然失败，列出目录结构排查原因："
-            ls -R "$COMMON_SRC/drivers/hid"
+            echo ">>> 编译失败，打印目录结构以便排查："
+            ls -R out/drivers/hid || echo "out/drivers/hid 目录不存在"
             exit 1
           fi           
       - name: 构建内核

@@ -1,5 +1,9 @@
-- name: 专门编译 hid-microsoft.ko 模块
-        run: |
+name: Build Xbox Vibration Module  # 第 1 行
+on:                                # 第 2 行 (请检查这里是否有空格或缩进错误)
+  workflow_dispatch:               # 手动触发
+  push:
+    branches:
+      - main                       # 或者是你的默认分支名
           WORKDIR="$(pwd)"
           cd kernel_workspace/common
           

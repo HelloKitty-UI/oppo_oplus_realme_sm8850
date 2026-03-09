@@ -542,35 +542,45 @@ jobs:
         run: |
           WORKDIR="$(pwd)"
           COMMON_SRC="$WORKDIR/kernel_workspace/common"
-          cd "$COMMON_SRC"
           
-          # 设置编译器路径和环境变量
+          # 1. 设置环境变量
           export PATH="$WORKDIR/kernel_workspace/clang19/bin:$WORKDIR/kernel_workspace/build-tools/bin:$PATH"
           export LLVM=1 LLVM_IAS=1 ARCH=arm64
           export CROSS_COMPILE=aarch64-linux-gnu-
           
-          echo ">>> 正在重新生成内核配置..."
-          # 这一步是关键：确保 out 目录下有 .config 文件
-          # 注意：这里使用 gki_defconfig 是基础，如果你的项目有特定的 vendor defconfig，请替换它
-          make O=out vendor/sm8850_defconfig || make O=out gki_defconfig
+          # 2. 确保配置存在
+          cd "$COMMON_SRC"
+          if [ ! -f "out/.config" ]; then
+            echo ">>> 重新生成配置..."
+            make O=out vendor/sm8850_defconfig || make O=out gki_defconfig
+          fi
           
-          echo ">>> 禁用本地版本号自动添加 (防止 -dirty 后缀)..."
-          sed -i 's/CONFIG_LOCALVERSION_AUTO=y/CONFIG_LOCALVERSION_AUTO=n/g' out/.config
+          # 3. 核心修复：直接进入驱动所在目录进行强制编译
+          echo ">>> 切换到驱动目录执行强编..."
+          cd drivers/hid
           
-          echo ">>> 正在准备模块构建环境..."
-          make -j$(nproc --all) O=out modules_prepare
+          # 直接调用顶层 Makefile 来编译当前目录下的对象
+          # 我们不再使用 M= 参数，而是让构建系统认为我们要编译这个文件夹里的目标
+          make -j$(nproc --all) -C ../../ O=../../out $(pwd)/hid-microsoft.o
           
-          echo ">>> 正在定向编译 hid-microsoft 驱动..."
-          # 使用 -C 指定源码根目录，M 指定模块相对路径
-          make -j$(nproc --all) -C . O=out M=drivers/hid modules
+          # 4. 手动链接成 .ko (如果上面的命令只出了 .o)
+          # 通常上面的命令会自动触发生成 .ko，我们去 out 目录找
+          echo ">>> 正在搜索生成的驱动文件..."
+          find ../../out/drivers/hid -name "hid-microsoft.ko" -exec cp {} ../../../hid-microsoft-fixed.ko \;
           
-          # 检查结果
-          if [ -f "out/drivers/hid/hid-microsoft.ko" ]; then
-            cp out/drivers/hid/hid-microsoft.ko ../../hid-microsoft-fixed.ko
-            echo ">>> 提取成功: hid-microsoft-fixed.ko"
+          # 5. 最终检查
+          if [ -f "../../../hid-microsoft-fixed.ko" ]; then
+            echo ">>> 成功提取: hid-microsoft-fixed.ko"
           else
-            echo ">>> 错误: 找不到生成的 .ko 文件！"
-            find out -name "*.ko"
+            echo ">>> 尝试备用方案：编译整个文件夹..."
+            cd "$COMMON_SRC"
+            make -j$(nproc --all) O=out drivers/hid/
+            find out/drivers/hid -name "hid-microsoft.ko" -exec cp {} ../../hid-microsoft-fixed.ko \;
+          fi
+
+          if [ ! -f "../../hid-microsoft-fixed.ko" ]; then
+            echo ">>> 依然失败，列出目录结构排查原因："
+            ls -R "$COMMON_SRC/drivers/hid"
             exit 1
           fi           
       - name: 构建内核

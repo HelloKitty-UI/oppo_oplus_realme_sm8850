@@ -1,40 +1,77 @@
 name: 加速版构建 6.12.23 欧加真OKI内核-带手柄修复
 
-env:
-  TZ: Asia/Shanghai
-  ANDROID_VERSION: 'android16'
-  KERNEL_VERSION: '6.12'
-  KERNEL_NAME: 'android16-5-ga8f88ad96df3-ab13929693-4k'
-  CCACHE_KEY: ccache-neov5-6.12.23
-
 on:
   workflow_dispatch:
     inputs:
       ksu_type:
-        description: 'KernelSU分支(resukisu/sukisu/ksunext/ksu/none)'
+        description: 'KernelSU分支'
         required: true
         type: choice
         default: 'resukisu'
         options:
           - 'resukisu'
-          - 'sukisu'
-          - 'ksunext'
-          - 'ksu'
           - 'none'
-      susfs_enable:
-        description: '是否开启susfs'
-        required: true
-        type: boolean
-        default: true
-      kpm_enable:
-        description: '是否开启kpm'
-        required: true
-        type: choice
-        default: 'false'
-        options:
-          - 'false'
-          - 'builtin'
-          - 'kpn'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 环境准备
+        uses: actions/checkout@v4
+
+      - name: 安装基础依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc build-essential flex bison libssl-dev libelf-dev clang lld llvm
+
+      - name: 拉取源码与官方工具链
+        run: |
+          mkdir kernel_workspace && cd kernel_workspace
+          # 1. 拉取内核源码 (使用默认分支以避免 404)
+          git clone --depth=1 https://github.com/HelloKitty-UI/android_kernel_common_oneplus_sm8850 common
+          
+          # 2. 下载 Android 官方 Clang (r522817) - 专为 Android 14/15 优化
+          mkdir clang19
+          wget https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r522817.tar.gz
+          tar -C clang19 -xzf clang-r522817.tar.gz
+          echo "工具链准备完毕"
+
+      - name: 注入 Xbox 0b13 振动支持
+        run: |
+          cd kernel_workspace/common
+          # 在 hid-microsoft.c 的设备列表中精准插入 0x0B13
+          sed -i '/{ }/i \	{ HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_MICROSOFT, 0x0B13), .driver_data = MS_QUIRK_FF },' drivers/hid/hid-microsoft.c
+          echo ">>> 源码修改验证："
+          grep -B 2 "0x0B13" drivers/hid/hid-microsoft.c
+
+      - name: 编译驱动模块 (.ko)
+        run: |
+          WORKDIR="$(pwd)"
+          cd kernel_workspace/common
+          
+          # 设置编译器环境变量
+          export PATH="$WORKDIR/kernel_workspace/clang19/bin:$PATH"
+          export LLVM=1 LLVM_IAS=1 ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          
+          # 1. 生成基础配置
+          make O=out vendor/sm8850_defconfig
+          
+          # 2. 移除版本号中的 -dirty 后缀以确保能成功加载
+          find out -name .config -exec sed -i 's/CONFIG_LOCALVERSION_AUTO=y/CONFIG_LOCALVERSION_AUTO=n/g' {} +
+          
+          # 3. 准备模块构建环境并定向编译 hid-microsoft
+          make -j$(nproc --all) O=out modules_prepare
+          make -j$(nproc --all) O=out M=drivers/hid modules
+          
+          # 4. 提取产物
+          cp out/drivers/hid/hid-microsoft.ko ../../hid-microsoft-fixed.ko
+
+      - name: 上传修复后的驱动文件
+        uses: actions/upload-artifact@v4
+        with:
+          name: Xbox-Vibration-Fix
+          path: hid-microsoft-fixed.ko          - 'kpn'
 
 jobs:
   build:

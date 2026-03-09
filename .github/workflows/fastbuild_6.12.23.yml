@@ -527,7 +527,12 @@ jobs:
           fi
           sed -i 's/${scm_version}//' ./common/scripts/setlocalversion
           echo "CONFIG_LOCALVERSION_AUTO=n" >> ./common/arch/arm64/configs/gki_defconfig
-
+      - name: 调试：列出驱动目录结构
+        run: |
+          echo ">>> 正在检查源码目录是否存在..."
+          ls -d kernel_workspace/common/drivers/hid || echo "找不到该目录！"
+          echo ">>> 正在列出 drivers/hid 下的所有文件..."
+          ls -R kernel_workspace/common/drivers/hid
       - name: 注入 Xbox 0b13 振动支持补丁
         run: |
           # 进入内核源码目录
@@ -538,46 +543,46 @@ jobs:
           echo ">>> 检查驱动修改是否成功："
           grep -C 3 "0x0B13" drivers/hid/hid-microsoft.c
 
-      - name: 专门编译并提取 hid-microsoft.ko 模块
+      - name: 终极方案编译 hid-microsoft.ko
         run: |
           WORKDIR="$(pwd)"
           COMMON_SRC="$WORKDIR/kernel_workspace/common"
           cd "$COMMON_SRC"
           
-          # 1. 设置环境变量
+          # 1. 环境准备
           export PATH="$WORKDIR/kernel_workspace/clang19/bin:$WORKDIR/kernel_workspace/build-tools/bin:$PATH"
-          export LLVM=1 LLVM_IAS=1 ARCH=arm64
-          export CROSS_COMPILE=aarch64-linux-gnu-
+          export LLVM=1 LLVM_IAS=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
           
-          # 2. 确保配置生成在 out 目录 (此时在 common 目录)
-          echo ">>> 正在生成基础配置..."
-          # 尝试多种可能的 defconfig 路径
+          # 2. 确保配置存在且强制设为模块
+          echo ">>> 正在强制生成并修正配置..."
           make O=out gki_defconfig
-          
-          # 3. 强制开启 HID_MICROSOFT 编译选项 (确保它被编译成模块)
-          echo ">>> 强制开启微软手柄模块配置..."
           sed -i 's/CONFIG_HID_MICROSOFT=y/CONFIG_HID_MICROSOFT=m/g' out/.config
           echo "CONFIG_HID_MICROSOFT=m" >> out/.config
           
-          # 4. 执行模块编译环境准备
+          # 3. 准备环境
           make -j$(nproc --all) O=out modules_prepare
           
-          # 5. 【核心修复】直接在根目录指定目标文件夹编译
-          # 这种写法会自动处理所有 Makefile 依赖，且 O=out 路径保持一致
-          echo ">>> 开始定向编译模块..."
-          make -j$(nproc --all) O=out M=drivers/hid modules
+          # 4. 【关键改动】不使用 M=，直接指定目标文件路径编译
+          # 这样 make 会在源码树里找 drivers/hid，并在 out 里生成产物
+          echo ">>> 正在编译目标驱动..."
+          make -j$(nproc --all) O=out drivers/hid/hid-microsoft.ko
           
-          # 6. 提取产物
-          echo ">>> 正在搜索并提取 .ko 文件..."
-          find out/drivers/hid -name "hid-microsoft.ko" -exec cp {} ../../hid-microsoft-fixed.ko \;
-          
-          # 7. 最终校验
-          if [ -f "../../hid-microsoft-fixed.ko" ]; then
+          # 5. 提取
+          echo ">>> 正在提取产物..."
+          if [ -f "out/drivers/hid/hid-microsoft.ko" ]; then
+            cp out/drivers/hid/hid-microsoft.ko ../../hid-microsoft-fixed.ko
             echo ">>> 模块提取成功！"
           else
-            echo ">>> 编译失败，打印目录结构以便排查："
-            ls -R out/drivers/hid || echo "out/drivers/hid 目录不存在"
-            exit 1
+            # 备选：如果上面没出 .ko，尝试编译整个目录
+            make -j$(nproc --all) O=out drivers/hid/
+            find out/drivers/hid -name "hid-microsoft.ko" -exec cp {} ../../hid-microsoft-fixed.ko \;
+          fi
+
+          # 6. 最后一道防线：检查文件是否存在
+          if [ ! -f "../../hid-microsoft-fixed.ko" ]; then
+             echo ">>> 报错：依然无法生成 .ko。这通常意味着内核配置中禁用了该驱动。"
+             grep "CONFIG_HID_MICROSOFT" out/.config
+             exit 1
           fi           
       - name: 构建内核
         run: |

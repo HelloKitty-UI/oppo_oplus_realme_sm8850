@@ -52,7 +52,7 @@ jobs:
         run: |
           mkdir kernel_workspace && cd kernel_workspace
           # 拉取主内核源码
-          git clone --depth=1 https://github.com/HelloKitty-UI/android_kernel_common_oneplus_sm8850 -b oneplus/sm8850 common
+          git clone --depth=1 https://github.com/HelloKitty-UI/android_kernel_common_oneplus_sm8850 common
           # 拉取编译脚本与工具 (Clang 19)
           git clone --depth=1 https://github.com/HelloKitty-UI/oppo_oplus_realme_sm8850 build-tools
           # 下载 Clang 19 (模拟原有 build.sh 中的下载逻辑)

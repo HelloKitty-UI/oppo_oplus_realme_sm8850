@@ -543,47 +543,7 @@ jobs:
           echo ">>> 检查驱动修改是否成功："
           grep -C 3 "0x0B13" drivers/hid/hid-microsoft.c
 
-      - name: 终极方案编译 hid-microsoft.ko
-        run: |
-          WORKDIR="$(pwd)"
-          COMMON_SRC="$WORKDIR/kernel_workspace/common"
-          cd "$COMMON_SRC"
-          
-          # 1. 环境准备
-          export PATH="$WORKDIR/kernel_workspace/clang19/bin:$WORKDIR/kernel_workspace/build-tools/bin:$PATH"
-          export LLVM=1 LLVM_IAS=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
-          
-          # 2. 确保配置存在且强制设为模块
-          echo ">>> 正在强制生成并修正配置..."
-          make O=out gki_defconfig
-          sed -i 's/CONFIG_HID_MICROSOFT=y/CONFIG_HID_MICROSOFT=m/g' out/.config
-          echo "CONFIG_HID_MICROSOFT=m" >> out/.config
-          
-          # 3. 准备环境
-          make -j$(nproc --all) O=out modules_prepare
-          
-          # 4. 【关键改动】不使用 M=，直接指定目标文件路径编译
-          # 这样 make 会在源码树里找 drivers/hid，并在 out 里生成产物
-          echo ">>> 正在编译目标驱动..."
-          make -j$(nproc --all) O=out drivers/hid/hid-microsoft.ko
-          
-          # 5. 提取
-          echo ">>> 正在提取产物..."
-          if [ -f "out/drivers/hid/hid-microsoft.ko" ]; then
-            cp out/drivers/hid/hid-microsoft.ko ../../hid-microsoft-fixed.ko
-            echo ">>> 模块提取成功！"
-          else
-            # 备选：如果上面没出 .ko，尝试编译整个目录
-            make -j$(nproc --all) O=out drivers/hid/
-            find out/drivers/hid -name "hid-microsoft.ko" -exec cp {} ../../hid-microsoft-fixed.ko \;
-          fi
-
-          # 6. 最后一道防线：检查文件是否存在
-          if [ ! -f "../../hid-microsoft-fixed.ko" ]; then
-             echo ">>> 报错：依然无法生成 .ko。这通常意味着内核配置中禁用了该驱动。"
-             grep "CONFIG_HID_MICROSOFT" out/.config
-             exit 1
-          fi           
+              
       - name: 构建内核
         run: |
           WORKDIR="$(pwd)"
@@ -712,7 +672,16 @@ jobs:
           ccache -s
           echo "编译后空间:"
           df -h
-
+      - name: 提取修复后的驱动
+        run: |
+          # 完整编译后，.ko 文件会自动出现在 out 目录对应的位置
+          if [ -f "kernel_workspace/common/out/drivers/hid/hid-microsoft.ko" ]; then
+            cp kernel_workspace/common/out/drivers/hid/hid-microsoft.ko ./hid-microsoft-fixed.ko
+            echo ">>> 提取成功！"
+          else
+            echo ">>> 没找到模块，尝试搜索..."
+            find kernel_workspace/common/out -name "hid-microsoft.ko" -exec cp {} ./hid-microsoft-fixed.ko \;
+          fi
       - name: 保存新的 ccache 缓存
         if: inputs.ccache_update || steps.ccache-restore.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4

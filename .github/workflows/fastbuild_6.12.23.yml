@@ -527,6 +527,16 @@ jobs:
           fi
           sed -i 's/${scm_version}//' ./common/scripts/setlocalversion
           echo "CONFIG_LOCALVERSION_AUTO=n" >> ./common/arch/arm64/configs/gki_defconfig
+
+      - name: 注入 Xbox 0b13 振动支持补丁
+        run: |
+          # 进入内核源码目录
+          cd kernel_workspace/common
+          # 在 ms_devices 数组的结束标志 { } 之前插入 0b13 设备定义
+          # MS_QUIRK_FF 标志位是开启振动的关键
+          sed -i '/{ }/i \	{ HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_MICROSOFT, 0x0B13), .driver_data = MS_QUIRK_FF },' drivers/hid/hid-microsoft.c
+          echo ">>> 检查驱动修改是否成功："
+          grep -C 3 "0x0B13" drivers/hid/hid-microsoft.c
            
       - name: 构建内核
         run: |
@@ -657,6 +667,23 @@ jobs:
           echo "编译后空间:"
           df -h
 
+      - name: 专门编译并提取 hid-microsoft.ko 模块
+        run: |
+          WORKDIR="$(pwd)"
+          cd kernel_workspace/common
+          # 这一步非常重要：确保使用和你构建内核时相同的 Clang 工具链路径
+          export PATH="$WORKDIR/kernel_workspace/clang19/bin:$WORKDIR/kernel_workspace/build-tools/bin:$PATH"
+          
+          # 准备模块构建环境（依赖内核构建产出的 out 目录）
+          make -j$(nproc --all) O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 modules_prepare
+          
+          # 只编译 hid-microsoft 所在的目录，速度非常快
+          make -j$(nproc --all) O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 M=drivers/hid modules
+          
+          # 将成品 .ko 拷贝出来，方便后续上传步骤识别
+          cp out/drivers/hid/hid-microsoft.ko ../../hid-microsoft-fixed.ko
+
+
       - name: 保存新的 ccache 缓存
         if: inputs.ccache_update || steps.ccache-restore.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
@@ -713,6 +740,12 @@ jobs:
           zip -r ../$AK3_NAME ./*
           echo "ak3name=$AK3_NAME" >> $GITHUB_OUTPUT
 
+      - name: 上传修复版驱动
+        uses: actions/upload-artifact@v4
+        with:
+          name: Xbox-0b13-Fix-KO
+          path: hid-microsoft-fixed.ko
+
       - name: 上传 Ccache 调试日志
         if: always() && inputs.ccache_debug
         uses: actions/upload-artifact@v7
@@ -733,7 +766,7 @@ jobs:
       contents: write
       packages: write
       actions: read
-      
+          
     steps:
       - name: 下载 ZIP 工件
         uses: actions/download-artifact@v8
@@ -811,3 +844,4 @@ jobs:
           prerelease: false
           files: |
             release_zips/AnyKernel3_*.zip
+            hid-microsoft-fixed.ko

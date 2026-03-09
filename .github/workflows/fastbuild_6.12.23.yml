@@ -541,38 +541,38 @@ jobs:
       - name: 专门编译并提取 hid-microsoft.ko 模块
         run: |
           WORKDIR="$(pwd)"
-          # 1. 定义源码根目录 (绝对路径)
           COMMON_SRC="$WORKDIR/kernel_workspace/common"
-          
-          # 2. 进入源码根目录
           cd "$COMMON_SRC"
           
-          # 3. 设置环境变量
+          # 设置编译器路径和环境变量
           export PATH="$WORKDIR/kernel_workspace/clang19/bin:$WORKDIR/kernel_workspace/build-tools/bin:$PATH"
           export LLVM=1 LLVM_IAS=1 ARCH=arm64
           export CROSS_COMPILE=aarch64-linux-gnu-
           
+          echo ">>> 正在重新生成内核配置..."
+          # 这一步是关键：确保 out 目录下有 .config 文件
+          # 注意：这里使用 gki_defconfig 是基础，如果你的项目有特定的 vendor defconfig，请替换它
+          make O=out vendor/sm8850_defconfig || make O=out gki_defconfig
+          
+          echo ">>> 禁用本地版本号自动添加 (防止 -dirty 后缀)..."
+          sed -i 's/CONFIG_LOCALVERSION_AUTO=y/CONFIG_LOCALVERSION_AUTO=n/g' out/.config
+          
           echo ">>> 正在准备模块构建环境..."
-          # 必须带上 O=out，否则找不到内核配置
           make -j$(nproc --all) O=out modules_prepare
           
           echo ">>> 正在定向编译 hid-microsoft 驱动..."
-          # 关键点：
-          # -C . 表示当前源码目录
-          # M=drivers/hid 指定相对于源码根目录的路径
-          # O=out 指向之前内核编译生成的产物目录
+          # 使用 -C 指定源码根目录，M 指定模块相对路径
           make -j$(nproc --all) -C . O=out M=drivers/hid modules
           
-          # 4. 检查并提取产物
+          # 检查结果
           if [ -f "out/drivers/hid/hid-microsoft.ko" ]; then
             cp out/drivers/hid/hid-microsoft.ko ../../hid-microsoft-fixed.ko
             echo ">>> 提取成功: hid-microsoft-fixed.ko"
           else
             echo ">>> 错误: 找不到生成的 .ko 文件！"
-            find out/drivers/hid -name "*.ko" || echo "该目录下无任何 .ko"
+            find out -name "*.ko"
             exit 1
-          fi
-           
+          fi           
       - name: 构建内核
         run: |
           WORKDIR="$(pwd)"

@@ -1,0 +1,92 @@
+name: 编译 xpadneo 完整驱动 (6.12 GKI)
+
+on:
+  workflow_dispatch:
+
+env:
+  TZ: Asia/Shanghai
+  # 必须严格对应 uname -r 的后缀
+  KERNEL_LOCALVERSION: "-android16-5-ga8f88ad96df3-ab13929693-4k"
+
+jobs:
+  build_xpadneo:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 安装环境依赖
+        run: |
+          sudo apt update
+          sudo apt-get install -y --no-install-recommends binutils python-is-python3 libssl-dev libelf-dev libdw-dev aria2 zip unzip bc dwarves git
+
+      - name: 初始化工具链与内核源码
+        run: |
+          mkdir -p workspace
+          cd workspace
+          # 下载 Clang 19
+          aria2c -s16 -x16 -k1M https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang19-r536225/clang-r536225.zip -o clang.zip
+          unzip -q clang.zip -d clang19
+          # 下载 6.12 内核源码
+          aria2c -s16 -x16 -k1M https://github.com/cctv18/android_kernel_common_oneplus_sm8850/archive/refs/heads/oneplus/sm8850_v_16.0.0_oneplus_15.zip -o common.zip
+          unzip -q common.zip
+          mv android_kernel_common_oneplus_sm8850-oneplus-sm8850_v_16.0.0_oneplus_15 common
+
+      - name: 克隆 xpadneo 源码
+        run: |
+          cd workspace
+          git clone https://github.com/atar-axis/xpadneo.git
+          # 进入源码目录，我们将只编译 hid-xpadneo 部分
+          cd xpadneo/hid-xpadneo/src
+          # 创建一个简易 Makefile 供交叉编译使用
+          cat << 'EOF' > Makefile
+          obj-m += hid-xpadneo.o
+          hid-xpadneo-y := xpadneo_main.o xpadneo_params.o xpadneo_ff.o
+          EOF
+
+      - name: 执行编译
+        run: |
+          cd workspace/common
+          export PATH="$(pwd)/../clang19/bin:$PATH"
+          CLANG_PREFIX="$(pwd)/../clang19/bin/"
+          
+          # 定义交叉编译参数
+          MAKE_ARGS="ARCH=arm64 \
+                     CROSS_COMPILE=aarch64-linux-gnu- \
+                     LLVM=1 \
+                     LLVM_IAS=1 \
+                     CLANG_TRIPLE=aarch64-linux-gnu- \
+                     LD=${CLANG_PREFIX}ld.lld \
+                     AR=${CLANG_PREFIX}llvm-ar \
+                     NM=${CLANG_PREFIX}llvm-nm \
+                     OBJCOPY=${CLANG_PREFIX}llvm-objcopy \
+                     OBJDUMP=${CLANG_PREFIX}llvm-objdump \
+                     STRIP=${CLANG_PREFIX}llvm-strip"
+
+          # 1. 基础配置
+          make $MAKE_ARGS gki_defconfig
+          
+          # 2. 强制同步版本号
+          sed -i 's/CONFIG_LOCALVERSION=.*/CONFIG_LOCALVERSION="${{ env.KERNEL_LOCALVERSION }}"/' .config
+          
+          # 3. 准备内核符号 (这一步对 xpadneo 的 FF 符号引用至关重要)
+          make $MAKE_ARGS modules_prepare
+          
+          # 4. 编译 xpadneo 模块
+          # 我们指向 xpadneo/hid-xpadneo/src 目录
+          make $MAKE_ARGS -C $(pwd) M=$(pwd)/../xpadneo/hid-xpadneo/src modules
+
+      - name: 验证并导出模块
+        run: |
+          MODULE_PATH="workspace/xpadneo/hid-xpadneo/src/hid-xpadneo.ko"
+          if [ -f "$MODULE_PATH" ]; then
+            echo "编译成功！"
+            # 检查 vermagic 是否匹配
+            strings $MODULE_PATH | grep vermagic
+          else
+            echo "编译失败，未找到 .ko 文件"
+            exit 1
+          fi
+
+      - name: 上传 Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hid-xpadneo-6.12-ko
+          path: workspace/xpadneo/hid-xpadneo/src/hid-xpadneo.ko

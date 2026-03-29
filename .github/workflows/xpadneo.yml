@@ -6,7 +6,7 @@ on:
 env:
   TZ: Asia/Shanghai
   # 请务必通过手机执行 uname -r 确认此版本号完全匹配
-  KERNEL_LOCALVERSION: "-android16-5-ga8f88ad96df3-ab13929693-4k"
+  KERNEL_LOCALVERSION: "-android16-5-g188c695beb6d-ab14367805-4k"
 
 jobs:
   build_xpadneo:

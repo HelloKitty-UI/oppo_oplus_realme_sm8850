@@ -534,7 +534,7 @@ jobs:
       - name: 集成 Xbox 震动驱动 (Built-in)
         run: |
           cd kernel_workspace/common
-          # 1. 创建驱动文件并写入代码
+          # 1. 写入经过优化的 C 驱动代码
           cat << 'EOF' > drivers/hid/hid-xbox-ff.c
           #include <linux/module.h>
           #include <linux/hid.h>
@@ -545,114 +545,114 @@ jobs:
           #define USB_VENDOR_ID_MICROSOFT 0x045E
           #define USB_DEVICE_ID_XBOX_BT   0x0B13
 
-struct xb1s_ff_report {
-    u8 report_id;
-    u8 enable;
-    u8 magnitude[2];
-    u8 duration;
-    u8 delay;
-    u8 loop;
-} __packed;
+          struct xb1s_ff_report {
+              u8 report_id;
+              u8 enable;
+              u8 magnitude[2];
+              u8 duration;
+              u8 delay;
+              u8 loop;
+          } __packed;
 
-struct xboxff {
-    struct hid_device *hdev;
-    struct work_struct work;
-    u8 strong;
-    u8 weak;
-};
+          struct xboxff {
+              struct hid_device *hdev;
+              struct work_struct work;
+              u8 strong;
+              u8 weak;
+          };
 
-static void xboxff_worker(struct work_struct *work) {
-    struct xboxff *x = container_of(work, struct xboxff, work);
-    struct xb1s_ff_report r;
-    memset(&r, 0, sizeof(r));
-    r.report_id = 3; // XB1S_FF_REPORT
-    r.enable = 0x03; // ENABLE_STRONG | ENABLE_WEAK
-    r.magnitude[0] = x->strong;
-    r.magnitude[1] = x->weak;
-    r.duration = 0xFF;
-    r.loop = 0xFF;
-    hid_hw_output_report(x->hdev, (u8 *)&r, sizeof(r));
-}
+          static void xboxff_worker(struct work_struct *work) {
+              struct xboxff *x = container_of(work, struct xboxff, work);
+              struct xb1s_ff_report r;
+              memset(&r, 0, sizeof(r));
+              r.report_id = 3;
+              r.enable = 0x03;
+              r.magnitude[0] = x->strong;
+              r.magnitude[1] = x->weak;
+              r.duration = 0xFF;
+              r.loop = 0xFF;
+              hid_hw_output_report(x->hdev, (u8 *)&r, sizeof(r));
+          }
 
-static int xboxff_play(struct input_dev *dev, void *data, struct ff_effect *effect) {
-    struct xboxff *x = data;
-    if (effect->type != FF_RUMBLE) return 0;
-    x->strong = effect->u.rumble.strong_magnitude >> 8;
-    x->weak   = effect->u.rumble.weak_magnitude >> 8;
-    schedule_work(&x->work);
-    return 0;
-}
+          static int xboxff_play(struct input_dev *dev, void *data, struct ff_effect *effect) {
+              struct xboxff *x = data;
+              if (effect->type != FF_RUMBLE) return 0;
+              x->strong = effect->u.rumble.strong_magnitude >> 8;
+              x->weak   = effect->u.rumble.weak_magnitude >> 8;
+              schedule_work(&x->work);
+              return 0;
+          }
 
-static int xboxff_probe(struct hid_device *hdev, const struct hid_device_id *id) {
-    struct xboxff *x;
-    struct input_dev *input;
-    int ret;
+          static int xboxff_probe(struct hid_device *hdev, const struct hid_device_id *id) {
+              struct xboxff *x;
+              struct input_dev *input;
+              int ret;
 
-    // 强行打印一条日志，只要匹配上了就一定能看到
-    hid_info(hdev, "Xboxff Driver: Probing device...\n");
+              hid_info(hdev, "Xboxff: Matching device...\n");
 
-    ret = hid_parse(hdev);
-    if (ret) return ret;
+              ret = hid_parse(hdev);
+              if (ret) return ret;
 
-    ret = hid_hw_start(hdev, HID_CONNECT_DEFAULT);
-    if (ret) return ret;
+              ret = hid_hw_start(hdev, HID_CONNECT_DEFAULT);
+              if (ret) return ret;
 
-    if (list_empty(&hdev->inputs)) {
-        hid_err(hdev, "No inputs found\n");
-        return -ENODEV;
-    }
+              if (list_empty(&hdev->inputs)) return -ENODEV;
+              input = list_first_entry(&hdev->inputs, struct hid_input, list)->input;
 
-    input = list_first_entry(&hdev->inputs, struct hid_input, list)->input;
+              x = devm_kzalloc(&hdev->dev, sizeof(*x), GFP_KERNEL);
+              if (!x) return -ENOMEM;
+
+              x->hdev = hdev;
+              INIT_WORK(&x->work, xboxff_worker);
+              hid_set_drvdata(hdev, x);
+
+              input_set_capability(input, EV_FF, FF_RUMBLE);
+              ret = input_ff_create_memless(input, x, xboxff_play);
+              if (ret) return ret;
+
+              hid_info(hdev, "Xbox FF driver (Built-in) active!\n");
+              return 0;
+          }
+
+          static void xboxff_remove(struct hid_device *hdev) {
+              struct xboxff *x = hid_get_drvdata(hdev);
+              if (x) cancel_work_sync(&x->work);
+              hid_hw_stop(hdev);
+          }
+
+          static const struct hid_device_id xboxff_ids[] = {
+              { HID_DEVICE(BUS_ANY, HID_GROUP_ANY, USB_VENDOR_ID_MICROSOFT, USB_DEVICE_ID_XBOX_BT) },
+              { HID_DEVICE(BUS_ANY, HID_GROUP_ANY, USB_VENDOR_ID_MICROSOFT, 0x02FD) },
+              { HID_DEVICE(BUS_ANY, HID_GROUP_ANY, USB_VENDOR_ID_MICROSOFT, 0x02E0) },
+              { HID_DEVICE(BUS_ANY, HID_GROUP_ANY, USB_VENDOR_ID_MICROSOFT, 0x0B05) },
+              { }
+          };
+          MODULE_DEVICE_TABLE(hid, xboxff_ids);
+
+          static struct hid_driver xboxff_driver = {
+              .name = "xboxff",
+              .id_table = xboxff_ids,
+              .probe = xboxff_probe,
+              .remove = xboxff_remove,
+          };
+
+          static int __init xboxff_init(void) {
+              return hid_register_driver(&xboxff_driver);
+          }
+          static void __exit xboxff_exit(void) {
+              hid_unregister_driver(&xboxff_driver);
+          }
+          module_init(xboxff_init);
+          module_exit(xboxff_exit);
+          MODULE_LICENSE("GPL");
+          EOF
+
+          # 2. 修改 Makefile
+          echo "obj-y += hid-xbox-ff.o" >> drivers/hid/Makefile
+
+          # 3. 强制在配置中启用震动框架
+          echo "CONFIG_INPUT_FF_MEMLESS=y" >> arch/arm64/configs/gki_defconfig
     
-    x = devm_kzalloc(&hdev->dev, sizeof(*x), GFP_KERNEL);
-    if (!x) return -ENOMEM;
-
-    x->hdev = hdev;
-    INIT_WORK(&x->work, xboxff_worker);
-    hid_set_drvdata(hdev, x);
-
-    input_set_capability(input, EV_FF, FF_RUMBLE);
-    ret = input_ff_create_memless(input, x, xboxff_play);
-    if (ret) return ret;
-
-    hid_info(hdev, "Xbox FF driver (Built-in) matched and active!\n");
-    return 0;
-}
-
-static void xboxff_remove(struct hid_device *hdev) {
-    struct xboxff *x = hid_get_drvdata(hdev);
-    if (x) cancel_work_sync(&x->work);
-    hid_hw_stop(hdev);
-}
-
-// 使用更通用的匹配宏，不限制总线和版本
-static const struct hid_device_id xboxff_ids[] = {
-    { HID_DEVICE(BUS_ANY, HID_GROUP_ANY, USB_VENDOR_ID_MICROSOFT, USB_DEVICE_ID_XBOX_BT) },
-    { HID_DEVICE(BUS_ANY, HID_GROUP_ANY, USB_VENDOR_ID_MICROSOFT, 0x02FD) },
-    { HID_DEVICE(BUS_ANY, HID_GROUP_ANY, USB_VENDOR_ID_MICROSOFT, 0x02E0) },
-    { }
-};
-MODULE_DEVICE_TABLE(hid, xboxff_ids);
-
-static struct hid_driver xboxff_driver = {
-    .name = "xboxff",
-    .id_table = xboxff_ids,
-    .probe = xboxff_probe,
-    .remove = xboxff_remove,
-};
-
-// 增加优先级：通过 module_init 手动注册，确保它在通用驱动之前
-static int __init xboxff_init(void) {
-    return hid_register_driver(&xboxff_driver);
-}
-static void __exit xboxff_exit(void) {
-    hid_unregister_driver(&xboxff_driver);
-}
-module_init(xboxff_init);
-module_exit(xboxff_exit);
-
-MODULE_LICENSE("GPL");
-
       - name: 添加制作名称
         run: |
           cd kernel_workspace

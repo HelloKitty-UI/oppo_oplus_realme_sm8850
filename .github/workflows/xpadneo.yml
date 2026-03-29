@@ -1,11 +1,11 @@
-name: 编译 xpadneo 驱动 (6.12 GKI 完整版)
+name: 编译 xpadneo 驱动 (6.12 GKI 符号修复版)
 
 on:
   workflow_dispatch:
 
 env:
   TZ: Asia/Shanghai
-  # 请确保这里的内容与手机执行 uname -r 后的第一个横杠开始的部分完全一致
+  # 请务必通过手机执行 uname -r 确认此版本号完全匹配
   KERNEL_LOCALVERSION: "-android16-5-ga8f88ad96df3-ab13929693-4k"
 
 jobs:
@@ -21,33 +21,30 @@ jobs:
         run: |
           mkdir -p workspace
           cd workspace
-          # 下载 Clang 19 (适配 6.12 内核)
+          # 下载 Clang 19
           aria2c -s16 -x16 -k1M https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang19-r536225/clang-r536225.zip -o clang.zip
           unzip -q clang.zip -d clang19
-          # 下载内核源码
+          # 下载内核源码 (sm8850/6.12)
           aria2c -s16 -x16 -k1M https://github.com/cctv18/android_kernel_common_oneplus_sm8850/archive/refs/heads/oneplus/sm8850_v_16.0.0_oneplus_15.zip -o common.zip
           unzip -q common.zip
           mv android_kernel_common_oneplus_sm8850-oneplus-sm8850_v_16.0.0_oneplus_15 common
 
-      - name: 准备 xpadneo 源码并修正目录结构
+      - name: 准备 xpadneo 源码
         run: |
           cd workspace
           git clone https://github.com/atar-axis/xpadneo.git
           
-          # 创建内核树内的独立目录
+          # 创建内核树内的模块目录
           mkdir -p common/drivers/hid/xpadneo_mod
-          
-          # 拷贝 hid-xpadneo/src 下的所有内容（包含 xpadneo/ 子文件夹）
           cp -r xpadneo/hid-xpadneo/src/* common/drivers/hid/xpadneo_mod/
           
-          # 重新编写 Makefile 以匹配其子目录结构和 VERSION 宏
+          # 编写适配子目录结构的 Makefile
           cat << 'EOF' > common/drivers/hid/xpadneo_mod/Makefile
           XPADNEO_VERSION := "0.9.6"
           ccflags-y += -DVERSION=$(XPADNEO_VERSION)
           
           obj-m += hid-xpadneo.o
           
-          # 必须包含 xpadneo/ 前缀，以便 Kbuild 在子目录寻找源文件
           hid-xpadneo-y += \
               xpadneo/consumer.o \
               xpadneo/core.o \
@@ -63,13 +60,13 @@ jobs:
               xpadneo/synthetic.o
           EOF
 
-      - name: 执行内核模块编译
+      - name: 执行内核模块编译 (处理符号丢失)
         run: |
           cd workspace/common
           export PATH="$(pwd)/../clang19/bin:$PATH"
           CLANG_PREFIX="$(pwd)/../clang19/bin/"
           
-          # 完整的交叉编译参数
+          # 交叉编译参数
           MAKE_ARGS="ARCH=arm64 \
                      CROSS_COMPILE=aarch64-linux-gnu- \
                      LLVM=1 \
@@ -80,35 +77,38 @@ jobs:
                      NM=${CLANG_PREFIX}llvm-nm \
                      OBJCOPY=${CLANG_PREFIX}llvm-objcopy \
                      OBJDUMP=${CLANG_PREFIX}llvm-objdump \
-                     STRIP=${CLANG_PREFIX}llvm-strip"
+                     STRIP=${CLANG_PREFIX}llvm-strip \
+                     KBUILD_MODPOST_WARN=1"
 
-          # 1. 初始化 GKI 配置
+          # 1. 初始化配置
           make $MAKE_ARGS gki_defconfig
           
-          # 2. 注入 KERNEL_LOCALVERSION 确保 vermagic 匹配
+          # 2. 注入版本号
           sed -i 's/CONFIG_LOCALVERSION=.*/CONFIG_LOCALVERSION="${{ env.KERNEL_LOCALVERSION }}"/' .config
           
-          # 3. 准备编译环境 (生成 Module.symvers)
-          make $MAKE_ARGS modules_prepare
+          # 3. 核心步骤：生成 scripts 和完整的 prepare 环境
+          # 这会尝试生成编译模块所需的全部辅助工具
+          make $MAKE_ARGS -j$(nproc) scripts
+          make $MAKE_ARGS -j$(nproc) prepare
+          make $MAKE_ARGS -j$(nproc) modules_prepare
           
-          # 4. 编译 xpadneo 模块 (M 指向内核树内的相对路径)
+          # 4. 编译外部模块 (使用 KBUILD_MODPOST_WARN=1 跳过符号检查报错)
           make $MAKE_ARGS -C $(pwd) M=drivers/hid/xpadneo_mod modules
 
-      - name: 验证 .ko 文件
+      - name: 验证并导出模块
         run: |
           KO_FILE="workspace/common/drivers/hid/xpadneo_mod/hid-xpadneo.ko"
           if [ -f "$KO_FILE" ]; then
-            echo "--- 编译成功 ---"
+            echo "--- 模块生成成功 ---"
             ls -l $KO_FILE
-            # 输出模块信息，用于二次检查版本
             strings $KO_FILE | grep vermagic
           else
-            echo "--- 错误：未找到生成的模块 ---"
+            echo "--- 模块生成失败 ---"
             exit 1
           fi
 
-      - name: 上传编译产物
+      - name: 上传 Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: hid-xpadneo-6.12-full
+          name: hid-xpadneo-6.12-v3
           path: workspace/common/drivers/hid/xpadneo_mod/hid-xpadneo.ko

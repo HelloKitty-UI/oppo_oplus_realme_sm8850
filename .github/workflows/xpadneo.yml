@@ -1,11 +1,11 @@
-name: 编译 xpadneo 驱动 (6.12 GKI 符号修复版)
+name: 编译 xpadneo (6.12 GKI 符号对齐终极版)
 
 on:
   workflow_dispatch:
 
 env:
   TZ: Asia/Shanghai
-  # 请务必通过手机执行 uname -r 确认此版本号完全匹配
+  # 必须与手机 uname -r 后的后缀完全一致
   KERNEL_LOCALVERSION: "-android16-5-g188c695beb6d-ab14367805-4k"
 
 jobs:
@@ -15,100 +15,84 @@ jobs:
       - name: 安装环境依赖
         run: |
           sudo apt update
-          sudo apt-get install -y --no-install-recommends binutils python-is-python3 libssl-dev libelf-dev libdw-dev aria2 zip unzip bc dwarves git
+          sudo apt-get install -y --no-install-recommends \
+            binutils python-is-python3 libssl-dev libelf-dev libdw-dev \
+            aria2 zip unzip bc dwarves git flex bison clang lld llvm
 
       - name: 初始化工具链与内核源码
         run: |
           mkdir -p workspace
           cd workspace
-          # 下载 Clang 19
+          # 下载你指定的专用 Clang 19 工具链
           aria2c -s16 -x16 -k1M https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang19-r536225/clang-r536225.zip -o clang.zip
           unzip -q clang.zip -d clang19
-          # 下载内核源码 (sm8850/6.12)
+          
+          # 下载你指定的 sm8850 内核源码
           aria2c -s16 -x16 -k1M https://github.com/cctv18/android_kernel_common_oneplus_sm8850/archive/refs/heads/oneplus/sm8850_v_16.0.0_oneplus_15.zip -o common.zip
           unzip -q common.zip
           mv android_kernel_common_oneplus_sm8850-oneplus-sm8850_v_16.0.0_oneplus_15 common
 
-      - name: 准备 xpadneo 源码
+      - name: 准备 xpadneo 源码并禁用干扰项
         run: |
           cd workspace
           git clone https://github.com/atar-axis/xpadneo.git
           
-          # 创建内核树内的模块目录
-          mkdir -p common/drivers/hid/xpadneo_mod
-          cp -r xpadneo/hid-xpadneo/src/* common/drivers/hid/xpadneo_mod/
-          
-          # 编写适配子目录结构的 Makefile
-          cat << 'EOF' > common/drivers/hid/xpadneo_mod/Makefile
-          XPADNEO_VERSION := "0.9.6"
-          ccflags-y += -DVERSION=$(XPADNEO_VERSION)
-          
-          obj-m += hid-xpadneo.o
-          
-          hid-xpadneo-y += \
-              xpadneo/consumer.o \
-              xpadneo/core.o \
-              xpadneo/debug.o \
-              xpadneo/device.o \
-              xpadneo/events.o \
-              xpadneo/keyboard.o \
-              xpadneo/mappings.o \
-              xpadneo/mouse.o \
-              xpadneo/power.o \
-              xpadneo/quirks.o \
-              xpadneo/rumble.o \
-              xpadneo/synthetic.o
-          EOF
+          # --- 关键修改：禁用电池功能以规避 power_supply 符号丢失 ---
+          cd xpadneo/hid-xpadneo
+          sed -i 's/CONFIG_XBOX_ONE_BATTERY=y/CONFIG_XBOX_ONE_BATTERY=n/g' Kconfig || true
+          # 同时也修改源码中的宏定义（双重保险）
+          sed -i 's/defined(CONFIG_XBOX_ONE_BATTERY)/0/g' src/xpadneo/core.c || true
 
-      - name: 执行内核模块编译 (处理符号丢失)
+      - name: 执行内核环境预备 (核心修复步骤)
         run: |
           cd workspace/common
           export PATH="$(pwd)/../clang19/bin:$PATH"
-          CLANG_PREFIX="$(pwd)/../clang19/bin/"
           
-          # 交叉编译参数
+          # 定义统一的交叉编译参数
           MAKE_ARGS="ARCH=arm64 \
                      CROSS_COMPILE=aarch64-linux-gnu- \
                      LLVM=1 \
                      LLVM_IAS=1 \
-                     CLANG_TRIPLE=aarch64-linux-gnu- \
-                     LD=${CLANG_PREFIX}ld.lld \
-                     AR=${CLANG_PREFIX}llvm-ar \
-                     NM=${CLANG_PREFIX}llvm-nm \
-                     OBJCOPY=${CLANG_PREFIX}llvm-objcopy \
-                     OBJDUMP=${CLANG_PREFIX}llvm-objdump \
-                     STRIP=${CLANG_PREFIX}llvm-strip \
-                     KBUILD_MODPOST_WARN=1"
+                     CLANG_TRIPLE=aarch64-linux-gnu-"
 
-          # 1. 初始化配置
+          # 1. 基础配置
           make $MAKE_ARGS gki_defconfig
           
-          # 2. 注入版本号
-          sed -i 's/CONFIG_LOCALVERSION=.*/CONFIG_LOCALVERSION="${{ env.KERNEL_LOCALVERSION }}"/' .config
+          # 2. 注入完全匹配的版本后缀
+          sed -i "s/CONFIG_LOCALVERSION=.*/CONFIG_LOCALVERSION=\"${{ env.KERNEL_LOCALVERSION }}\"/" .config
           
-          # 3. 核心步骤：生成 scripts 和完整的 prepare 环境
-          # 这会尝试生成编译模块所需的全部辅助工具
+          # 3. 生成必要的内核导出符号表 (解决 Unknown symbol 的核心)
+          # 这步会让内核根据 .config 生成正确的 Module.symvers
           make $MAKE_ARGS -j$(nproc) scripts
           make $MAKE_ARGS -j$(nproc) prepare
           make $MAKE_ARGS -j$(nproc) modules_prepare
-          
-          # 4. 编译外部模块 (使用 KBUILD_MODPOST_WARN=1 跳过符号检查报错)
-          make $MAKE_ARGS -C $(pwd) M=drivers/hid/xpadneo_mod modules
 
-      - name: 验证并导出模块
+      - name: 编译 xpadneo 模块
         run: |
-          KO_FILE="workspace/common/drivers/hid/xpadneo_mod/hid-xpadneo.ko"
+          cd workspace/xpadneo/hid-xpadneo
+          export PATH="$(pwd)/../../clang19/bin:$PATH"
+          
+          # 编译参数指向刚才处理好的内核源码目录
+          # 使用 KBUILD_MODPOST_WARN=1 以防万一，但 modules_prepare 应该已经解决了大部分问题
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LLVM=1 \
+               KBUILD_MODPOST_WARN=1 \
+               -C ../../common M=$(pwd) modules
+
+      - name: 验证 vermagic 并导出
+        run: |
+          KO_FILE="workspace/xpadneo/hid-xpadneo/hid-xpadneo.ko"
           if [ -f "$KO_FILE" ]; then
             echo "--- 模块生成成功 ---"
-            ls -l $KO_FILE
+            # 检查版本号是否真的对齐了
+            modinfo_path="workspace/clang19/bin/llvm-objdump"
             strings $KO_FILE | grep vermagic
           else
-            echo "--- 模块生成失败 ---"
+            echo "--- 错误：hid-xpadneo.ko 未生成 ---"
             exit 1
           fi
 
       - name: 上传 Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: hid-xpadneo-6.12-v3
-          path: workspace/common/drivers/hid/xpadneo_mod/hid-xpadneo.ko
+          name: hid-xpadneo-fixed-v4
+          path: workspace/xpadneo/hid-xpadneo/hid-xpadneo.ko

@@ -1,4 +1,4 @@
-name: 编译 xpadneo (内核缝合与 BTF 修复版)
+name: 编译 xpadneo (符号指纹兼容版)
 
 on:
   workflow_dispatch:
@@ -27,7 +27,7 @@ jobs:
           aria2c -s16 -x16 -k1M https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang19-r536225/clang-r536225.zip -o clang.zip
           unzip -q clang.zip -d clang19
           
-          # 下载一加内核源码 (sm8850/6.12)
+          # 下载一加内核源码
           aria2c -s16 -x16 -k1M https://github.com/cctv18/android_kernel_common_oneplus_sm8850/archive/refs/heads/oneplus/sm8850_v_16.0.0_oneplus_15.zip -o common.zip
           unzip -q common.zip
           mv android_kernel_common_oneplus_sm8850-oneplus-sm8850_v_16.0.0_oneplus_15 common
@@ -37,17 +37,15 @@ jobs:
           cd workspace
           git clone https://github.com/atar-axis/xpadneo.git
           
-          # 1. 在内核 HID 驱动目录下创建 xpadneo 文件夹
+          # 1. 建立内核树内目录
           mkdir -p common/drivers/hid/xpadneo
-          
-          # 2. 拷贝驱动源码文件
           cp -r xpadneo/hid-xpadneo/src/xpadneo/* common/drivers/hid/xpadneo/
           
-          # 3. 强制禁用电池上报功能 (避免 power_supply 符号冲突)
+          # 2. 强行屏蔽代码中的电池逻辑
           cd common/drivers/hid/xpadneo
           sed -i 's/defined(CONFIG_XBOX_ONE_BATTERY)/0/g' core.c || true
           
-          # 4. 创建树内 Makefile
+          # 3. 创建树内 Makefile
           cat << 'EOF' > Makefile
           XPADNEO_VERSION := "0.9.6"
           ccflags-y += -DVERSION=$(XPADNEO_VERSION)
@@ -55,57 +53,59 @@ jobs:
           hid-xpadneo-y := consumer.o core.o debug.o device.o events.o keyboard.o mappings.o mouse.o power.o quirks.o rumble.o synthetic.o
           EOF
 
-          # 5. 修改内核驱动 Makefile，将 xpadneo 目录加入扫描
+          # 4. 挂载到内核驱动主 Makefile
           echo "obj-y += xpadneo/" >> ../Makefile
 
-      - name: 全量符号对齐编译 (禁用 BTF 修复版)
+      - name: 配置内核并强制解除校验限制
         run: |
           cd workspace/common
           export PATH="$(pwd)/../clang19/bin:$PATH"
-          
-          MAKE_ARGS="ARCH=arm64 \
-                     CROSS_COMPILE=aarch64-linux-gnu- \
-                     LLVM=1 \
-                     LLVM_IAS=1 \
-                     CLANG_TRIPLE=aarch64-linux-gnu-"
+          MAKE_ARGS="ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LLVM=1 LLVM_IAS=1 CLANG_TRIPLE=aarch64-linux-gnu-"
 
-          # 1. 初始化配置
+          # 1. 生成基础配置
           make $MAKE_ARGS gki_defconfig
           
-          # 2. 【核心修复】禁用 BTF 和调试信息生成，防止 vmlinux 链接阶段报错
-          scripts/config --disable CONFIG_DEBUG_INFO_BTF
-          scripts/config --disable CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT
-          scripts/config --disable CONFIG_DEBUG_INFO_DWARF4
-          scripts/config --disable CONFIG_DEBUG_INFO_DWARF5
+          # 2. 【核心修复】解除所有可能导致加载失败的校验锁
+          ./scripts/config --disable CONFIG_MODVERSIONS      # 解决 module_layout 报错
+          ./scripts/config --disable CONFIG_MODULE_SIG       # 解决签名报错
+          ./scripts/config --disable CONFIG_MODULE_SIG_ALL
+          ./scripts/config --disable CONFIG_MODULE_SIG_FORCE
+          ./scripts/config --disable CONFIG_DEBUG_INFO_BTF   # 解决 vmlinux 编译报错
           
-          # 3. 注入版本后缀
+          # 3. 强制对齐版本号后缀
           sed -i "s/CONFIG_LOCALVERSION=.*/CONFIG_LOCALVERSION=\"${{ env.KERNEL_LOCALVERSION }}\"/" .config
           
-          # 4. 预准备环境
+          # 4. 准备环境
           make $MAKE_ARGS -j$(nproc) scripts
           make $MAKE_ARGS -j$(nproc) prepare
           make $MAKE_ARGS -j$(nproc) modules_prepare
+
+      - name: 编译全量模块 (符号自动对齐)
+        run: |
+          cd workspace/common
+          export PATH="$(pwd)/../clang19/bin:$PATH"
+          MAKE_ARGS="ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LLVM=1 LLVM_IAS=1 CLANG_TRIPLE=aarch64-linux-gnu-"
           
-          # 5. 编译所有模块
-          # 系统会自动处理 drivers/hid/xpadneo/ 下的模块链接
+          # 编译所有模块，这会生成我们缝合进去的 xpadneo
           make $MAKE_ARGS -j$(nproc) modules
 
-      - name: 验证并提取驱动模块
+      - name: 提取并检查驱动
         run: |
-          KO_FILE="workspace/common/drivers/hid/xpadneo/hid-xpadneo.ko"
-          
-          if [ -f "$KO_FILE" ]; then
-            echo "--- 缝合编译成功 ---"
-            # 打印 vermagic 确保与手机内核完全一致
-            strings "$KO_FILE" | grep vermagic
+          KO_PATH="workspace/common/drivers/hid/xpadneo/hid-xpadneo.ko"
+          if [ -f "$KO_PATH" ]; then
+            echo "--- 驱动编译成功 ---"
+            # 验证指纹
+            strings "$KO_PATH" | grep vermagic
+            # 验证是否还带有版本校验信息 (应该为空)
+            strings "$KO_PATH" | grep module_layout || echo "Success: No module_layout CRC found"
           else
-            echo "--- 错误：未能生成 .ko 文件，尝试全量搜索 ---"
+            echo "--- 错误：未找到模块 ---"
             find workspace/common -name "hid-xpadneo.ko"
             exit 1
           fi
 
-      - name: 上传模块文件
+      - name: 上传 Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: hid-xpadneo-btf-fixed
+          name: hid-xpadneo-no-verify
           path: workspace/common/drivers/hid/xpadneo/hid-xpadneo.ko

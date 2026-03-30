@@ -1,4 +1,4 @@
-name: 编译 xpadneo (6.12 GKI 符号对齐终极版)
+name: 编译 xpadneo (官方源码驱动对齐版)
 
 on:
   workflow_dispatch:
@@ -23,76 +23,80 @@ jobs:
         run: |
           mkdir -p workspace
           cd workspace
-          # 下载你指定的专用 Clang 19 工具链
+          # 下载专用 Clang 19 工具链
           aria2c -s16 -x16 -k1M https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang19-r536225/clang-r536225.zip -o clang.zip
           unzip -q clang.zip -d clang19
           
-          # 下载你指定的 sm8850 内核源码
+          # 下载 sm8850 内核源码
           aria2c -s16 -x16 -k1M https://github.com/cctv18/android_kernel_common_oneplus_sm8850/archive/refs/heads/oneplus/sm8850_v_16.0.0_oneplus_15.zip -o common.zip
           unzip -q common.zip
           mv android_kernel_common_oneplus_sm8850-oneplus-sm8850_v_16.0.0_oneplus_15 common
 
-      - name: 准备 xpadneo 源码并禁用干扰项
+      - name: 准备 xpadneo 源码并禁用电池功能
         run: |
           cd workspace
           git clone https://github.com/atar-axis/xpadneo.git
           
-          # --- 关键修改：禁用电池功能以规避 power_supply 符号丢失 ---
+          # 关键：彻底关闭驱动对电源管理符号的依赖
+          # 这能解决之前 dmesg 中 power_supply_powers (err -2) 的报错
           cd xpadneo/hid-xpadneo
           sed -i 's/CONFIG_XBOX_ONE_BATTERY=y/CONFIG_XBOX_ONE_BATTERY=n/g' Kconfig || true
-          # 同时也修改源码中的宏定义（双重保险）
-          sed -i 's/defined(CONFIG_XBOX_ONE_BATTERY)/0/g' src/xpadneo/core.c || true
+          # 在核心代码中强行关掉电池逻辑
+          sed -i 's/#define CONFIG_XBOX_ONE_BATTERY/\/\/#define CONFIG_XBOX_ONE_BATTERY/g' src/xpadneo/core.c || true
 
-      - name: 执行内核环境预备 (核心修复步骤)
+      - name: 生成内核环境与符号表
         run: |
           cd workspace/common
           export PATH="$(pwd)/../clang19/bin:$PATH"
           
-          # 定义统一的交叉编译参数
           MAKE_ARGS="ARCH=arm64 \
                      CROSS_COMPILE=aarch64-linux-gnu- \
                      LLVM=1 \
                      LLVM_IAS=1 \
                      CLANG_TRIPLE=aarch64-linux-gnu-"
 
-          # 1. 基础配置
+          # 初始化并注入版本号
           make $MAKE_ARGS gki_defconfig
-          
-          # 2. 注入完全匹配的版本后缀
           sed -i "s/CONFIG_LOCALVERSION=.*/CONFIG_LOCALVERSION=\"${{ env.KERNEL_LOCALVERSION }}\"/" .config
           
-          # 3. 生成必要的内核导出符号表 (解决 Unknown symbol 的核心)
-          # 这步会让内核根据 .config 生成正确的 Module.symvers
+          # 生成编译驱动必须的脚本、头文件和 Module.symvers
           make $MAKE_ARGS -j$(nproc) scripts
           make $MAKE_ARGS -j$(nproc) prepare
           make $MAKE_ARGS -j$(nproc) modules_prepare
 
-      - name: 编译 xpadneo 模块
+      - name: 编译 xpadneo 模块 (调用官方构建逻辑)
         run: |
+          # 进入驱动源代码所在目录
           cd workspace/xpadneo/hid-xpadneo
           export PATH="$(pwd)/../../clang19/bin:$PATH"
           
-          # 编译参数指向刚才处理好的内核源码目录
-          # 使用 KBUILD_MODPOST_WARN=1 以防万一，但 modules_prepare 应该已经解决了大部分问题
+          # 将内核生成的符号表拷贝过来辅助对齐
+          cp ../../common/Module.symvers ./src/Module.symvers || true
+          
+          # M=$(pwd)/src 是关键，因为驱动的 C 文件都在 src/xpadneo/ 下
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LLVM=1 \
                KBUILD_MODPOST_WARN=1 \
-               -C ../../common M=$(pwd) modules
+               -C ../../common M=$(pwd)/src modules
 
-      - name: 验证 vermagic 并导出
+      - name: 验证 .ko 生成并导出
         run: |
-          KO_FILE="workspace/xpadneo/hid-xpadneo/hid-xpadneo.ko"
-          if [ -f "$KO_FILE" ]; then
-            echo "--- 模块生成成功 ---"
-            # 检查版本号是否真的对齐了
-            modinfo_path="workspace/clang19/bin/llvm-objdump"
-            strings $KO_FILE | grep vermagic
+          # 在 xpadneo 目录下搜索生成的 ko 文件
+          KO_FILE=$(find workspace/xpadneo -name "hid-xpadneo.ko" | head -n 1)
+          
+          if [ -n "$KO_FILE" ] && [ -f "$KO_FILE" ]; then
+            echo "--- 驱动生成成功 ---"
+            echo "路径: $KO_FILE"
+            # 检查驱动的内核版本信息
+            strings "$KO_FILE" | grep vermagic
           else
-            echo "--- 错误：hid-xpadneo.ko 未生成 ---"
+            echo "--- 错误：驱动编译失败，未找到 .ko 文件 ---"
+            # 打印目录列表辅助调试
+            ls -R workspace/xpadneo
             exit 1
           fi
 
       - name: 上传 Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: hid-xpadneo-fixed-v4
-          path: workspace/xpadneo/hid-xpadneo/hid-xpadneo.ko
+          name: hid-xpadneo-official-src-v4
+          path: "**/*.ko"

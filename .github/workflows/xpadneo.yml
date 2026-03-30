@@ -1,11 +1,10 @@
-name: 编译 xpadneo (官方源码驱动对齐版)
+name: 编译 xpadneo (内核缝合对齐版)
 
 on:
   workflow_dispatch:
 
 env:
   TZ: Asia/Shanghai
-  # 必须与手机 uname -r 后的后缀完全一致
   KERNEL_LOCALVERSION: "-android16-5-g188c695beb6d-ab14367805-4k"
 
 jobs:
@@ -23,28 +22,38 @@ jobs:
         run: |
           mkdir -p workspace
           cd workspace
-          # 下载专用 Clang 19 工具链
+          # 下载 Clang 19
           aria2c -s16 -x16 -k1M https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang19-r536225/clang-r536225.zip -o clang.zip
           unzip -q clang.zip -d clang19
-          
-          # 下载 sm8850 内核源码
+          # 下载内核源码
           aria2c -s16 -x16 -k1M https://github.com/cctv18/android_kernel_common_oneplus_sm8850/archive/refs/heads/oneplus/sm8850_v_16.0.0_oneplus_15.zip -o common.zip
           unzip -q common.zip
           mv android_kernel_common_oneplus_sm8850-oneplus-sm8850_v_16.0.0_oneplus_15 common
 
-      - name: 准备 xpadneo 源码并禁用电池功能
+      - name: 缝合 xpadneo 到内核树
         run: |
           cd workspace
           git clone https://github.com/atar-axis/xpadneo.git
           
-          # 关键：彻底关闭驱动对电源管理符号的依赖
-          # 这能解决之前 dmesg 中 power_supply_powers (err -2) 的报错
-          cd xpadneo/hid-xpadneo
-          sed -i 's/CONFIG_XBOX_ONE_BATTERY=y/CONFIG_XBOX_ONE_BATTERY=n/g' Kconfig || true
-          # 在核心代码中强行关掉电池逻辑
-          sed -i 's/#define CONFIG_XBOX_ONE_BATTERY/\/\/#define CONFIG_XBOX_ONE_BATTERY/g' src/xpadneo/core.c || true
+          # 1. 在内核驱动目录下创建专用文件夹
+          mkdir -p common/drivers/hid/xpadneo_in_tree
+          
+          # 2. 拷贝源码 (注意路径，我们需要 src 下的代码)
+          cp -r xpadneo/hid-xpadneo/src/xpadneo/* common/drivers/hid/xpadneo_in_tree/
+          
+          # 3. 禁用电池功能 (防止 power_supply 符号干扰)
+          sed -i 's/defined(CONFIG_XBOX_ONE_BATTERY)/0/g' common/drivers/hid/xpadneo_in_tree/core.c
+          
+          # 4. 关键：创建树内 Makefile
+          # 这样写会让编译器认为它是内核的“嫡系”
+          cat << 'EOF' > common/drivers/hid/xpadneo_in_tree/Makefile
+          XPADNEO_VERSION := "0.9.6"
+          ccflags-y += -I$(srctree)/drivers/hid/xpadneo_in_tree -DVERSION=$(XPADNEO_VERSION)
+          obj-m += hid-xpadneo.o
+          hid-xpadneo-y := consumer.o core.o debug.o device.o events.o keyboard.o mappings.o mouse.o power.o quirks.o rumble.o synthetic.o
+          EOF
 
-      - name: 生成内核环境与符号表
+      - name: 执行对齐编译
         run: |
           cd workspace/common
           export PATH="$(pwd)/../clang19/bin:$PATH"
@@ -55,48 +64,30 @@ jobs:
                      LLVM_IAS=1 \
                      CLANG_TRIPLE=aarch64-linux-gnu-"
 
-          # 初始化并注入版本号
+          # 初始化并对齐版本号
           make $MAKE_ARGS gki_defconfig
           sed -i "s/CONFIG_LOCALVERSION=.*/CONFIG_LOCALVERSION=\"${{ env.KERNEL_LOCALVERSION }}\"/" .config
           
-          # 生成编译驱动必须的脚本、头文件和 Module.symvers
-          make $MAKE_ARGS -j$(nproc) scripts
-          make $MAKE_ARGS -j$(nproc) prepare
+          # 预准备环境
           make $MAKE_ARGS -j$(nproc) modules_prepare
+          
+          # 核心步骤：编译这个特定的树内文件夹为模块
+          # 这次由于在 drivers/hid 路径下，它能自动解析到 hid_hw_start 等函数
+          make $MAKE_ARGS -j$(nproc) M=drivers/hid/xpadneo_in_tree modules
 
-      - name: 编译 xpadneo 模块 (调用官方构建逻辑)
+      - name: 提取并检查
         run: |
-          # 进入驱动源代码所在目录
-          cd workspace/xpadneo/hid-xpadneo
-          export PATH="$(pwd)/../../clang19/bin:$PATH"
-          
-          # 将内核生成的符号表拷贝过来辅助对齐
-          cp ../../common/Module.symvers ./src/Module.symvers || true
-          
-          # M=$(pwd)/src 是关键，因为驱动的 C 文件都在 src/xpadneo/ 下
-          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LLVM=1 \
-               KBUILD_MODPOST_WARN=1 \
-               -C ../../common M=$(pwd)/src modules
-
-      - name: 验证 .ko 生成并导出
-        run: |
-          # 在 xpadneo 目录下搜索生成的 ko 文件
-          KO_FILE=$(find workspace/xpadneo -name "hid-xpadneo.ko" | head -n 1)
-          
-          if [ -n "$KO_FILE" ] && [ -f "$KO_FILE" ]; then
-            echo "--- 驱动生成成功 ---"
-            echo "路径: $KO_FILE"
-            # 检查驱动的内核版本信息
-            strings "$KO_FILE" | grep vermagic
+          KO_FILE="workspace/common/drivers/hid/xpadneo_in_tree/hid-xpadneo.ko"
+          if [ -f "$KO_FILE" ]; then
+            echo "--- 缝合编译成功 ---"
+            strings $KO_FILE | grep vermagic
           else
-            echo "--- 错误：驱动编译失败，未找到 .ko 文件 ---"
-            # 打印目录列表辅助调试
-            ls -R workspace/xpadneo
+            echo "--- 编译失败 ---"
             exit 1
           fi
 
-      - name: 上传 Artifact
+      - name: 上传模块
         uses: actions/upload-artifact@v4
         with:
-          name: hid-xpadneo-official-src-v4
-          path: "**/*.ko"
+          name: hid-xpadneo-intree
+          path: workspace/common/drivers/hid/xpadneo_in_tree/hid-xpadneo.ko

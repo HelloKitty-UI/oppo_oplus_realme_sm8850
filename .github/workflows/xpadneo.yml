@@ -1,11 +1,11 @@
-name: 编译 xpadneo (内核缝合与 BTF 修复版)
+name: 编译 xpadneo (模块格式修复版)
 
 on:
   workflow_dispatch:
 
 env:
   TZ: Asia/Shanghai
-  # 必须与你手机执行 uname -r 后的结果完全一致
+  # 确保这个后缀与你的手机 uname -r 完全一致
   KERNEL_LOCALVERSION: "-android16-5-g188c695beb6d-ab14367805-4k"
 
 jobs:
@@ -23,89 +23,87 @@ jobs:
         run: |
           mkdir -p workspace
           cd workspace
-          # 下载专用 Clang 19 工具链
+          # 下载专用 Clang 19
           aria2c -s16 -x16 -k1M https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang19-r536225/clang-r536225.zip -o clang.zip
           unzip -q clang.zip -d clang19
           
-          # 下载一加内核源码 (sm8850/6.12)
+          # 下载内核源码
           aria2c -s16 -x16 -k1M https://github.com/cctv18/android_kernel_common_oneplus_sm8850/archive/refs/heads/oneplus/sm8850_v_16.0.0_oneplus_15.zip -o common.zip
           unzip -q common.zip
           mv android_kernel_common_oneplus_sm8850-oneplus-sm8850_v_16.0.0_oneplus_15 common
 
-      - name: 深度缝合 xpadneo 到内核源码树
+      - name: 深度缝合 xpadneo 源码
         run: |
           cd workspace
           git clone https://github.com/atar-axis/xpadneo.git
           
-          # 1. 在内核 HID 驱动目录下创建 xpadneo 文件夹
+          # 创建内核树内目录
           mkdir -p common/drivers/hid/xpadneo
-          
-          # 2. 拷贝驱动源码文件
           cp -r xpadneo/hid-xpadneo/src/xpadneo/* common/drivers/hid/xpadneo/
           
-          # 3. 强制禁用电池上报功能 (避免 power_supply 符号冲突)
-          cd common/drivers/hid/xpadneo
-          sed -i 's/defined(CONFIG_XBOX_ONE_BATTERY)/0/g' core.c || true
+          # 禁用电池逻辑 (避免 power_supply 符号冲突)
+          sed -i 's/defined(CONFIG_XBOX_ONE_BATTERY)/0/g' common/drivers/hid/xpadneo/core.c || true
           
-          # 4. 创建树内 Makefile
-          cat << 'EOF' > Makefile
-          XPADNEO_VERSION := "0.9.6"
-          ccflags-y += -DVERSION=$(XPADNEO_VERSION)
+          # 【重要修复】创建一个极其纯净的 Makefile，不带任何可能触发 static 的参数
+          cat << 'EOF' > common/drivers/hid/xpadneo/Makefile
           obj-m += hid-xpadneo.o
           hid-xpadneo-y := consumer.o core.o debug.o device.o events.o keyboard.o mappings.o mouse.o power.o quirks.o rumble.o synthetic.o
+          ccflags-y += -DVERSION=\"0.9.6\"
           EOF
 
-          # 5. 修改内核驱动 Makefile，将 xpadneo 目录加入扫描
-          echo "obj-y += xpadneo/" >> ../Makefile
+          # 挂载到主构建树
+          echo "obj-y += xpadneo/" >> common/drivers/hid/Makefile
 
-      - name: 全量符号对齐编译 (禁用 BTF 修复版)
+      - name: 符号对齐与模块构建
         run: |
           cd workspace/common
           export PATH="$(pwd)/../clang19/bin:$PATH"
           
-          MAKE_ARGS="ARCH=arm64 \
-                     CROSS_COMPILE=aarch64-linux-gnu- \
-                     LLVM=1 \
-                     LLVM_IAS=1 \
-                     CLANG_TRIPLE=aarch64-linux-gnu-"
+          # 【核心修复】强制清理所有可能干扰链接的环境变量
+          unset LDFLAGS
+          unset CFLAGS
+          unset CPPFLAGS
+          unset LIBS
+          
+          MAKE_ARGS="ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LLVM=1 LLVM_IAS=1 CLANG_TRIPLE=aarch64-linux-gnu-"
 
-          # 1. 初始化配置
+          # 1. 配置内核
           make $MAKE_ARGS gki_defconfig
           
-          # 2. 【核心修复】禁用 BTF 和调试信息生成，防止 vmlinux 链接阶段报错
-          scripts/config --disable CONFIG_DEBUG_INFO_BTF
-          scripts/config --disable CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT
-          scripts/config --disable CONFIG_DEBUG_INFO_DWARF4
-          scripts/config --disable CONFIG_DEBUG_INFO_DWARF5
+          # 2. 禁用导致报错的校验和调试信息
+          ./scripts/config --disable CONFIG_DEBUG_INFO_BTF
+          ./scripts/config --disable CONFIG_MODVERSIONS
+          ./scripts/config --disable CONFIG_MODULE_SIG
           
           # 3. 注入版本后缀
           sed -i "s/CONFIG_LOCALVERSION=.*/CONFIG_LOCALVERSION=\"${{ env.KERNEL_LOCALVERSION }}\"/" .config
           
-          # 4. 预准备环境
-          make $MAKE_ARGS -j$(nproc) scripts
-          make $MAKE_ARGS -j$(nproc) prepare
-          make $MAKE_ARGS -j$(nproc) modules_prepare
+          # 4. 准备模块编译环境
+          make $MAKE_ARGS -j$(nproc) scripts prepare modules_prepare
           
-          # 5. 编译所有模块
-          # 系统会自动处理 drivers/hid/xpadneo/ 下的模块链接
-          make $MAKE_ARGS -j$(nproc) modules
+          # 5. 【关键修改】专门针对该目录进行模块化编译
+          # 使用 M= 参数会强制调用内核的模块链接脚本，确保产出 relocatable ELF
+          make $MAKE_ARGS -j$(nproc) M=drivers/hid/xpadneo modules
 
-      - name: 验证并提取驱动模块
+      - name: 验证文件属性 (防止 Static 再次出现)
         run: |
-          KO_FILE="workspace/common/drivers/hid/xpadneo/hid-xpadneo.ko"
-          
-          if [ -f "$KO_FILE" ]; then
-            echo "--- 缝合编译成功 ---"
-            # 打印 vermagic 确保与手机内核完全一致
-            strings "$KO_FILE" | grep vermagic
+          KO_PATH="workspace/common/drivers/hid/xpadneo/hid-xpadneo.ko"
+          if [ -f "$KO_PATH" ]; then
+            echo "--- 检查模块属性 ---"
+            file "$KO_PATH"
+            # 如果依然包含 static 字样，这里会报错提醒
+            if grep -q "static" <(file "$KO_PATH"); then
+               echo "错误：编译出的模块依然是静态链接格式！"
+               exit 1
+            fi
+            cp "$KO_PATH" ./hid-xpadneo.ko
           else
-            echo "--- 错误：未能生成 .ko 文件，尝试全量搜索 ---"
-            find workspace/common -name "hid-xpadneo.ko"
+            echo "错误：未生成 .ko 文件"
             exit 1
           fi
 
-      - name: 上传模块文件
+      - name: 上传 Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: hid-xpadneo-btf-fixed
-          path: workspace/common/drivers/hid/xpadneo/hid-xpadneo.ko
+          name: hid-xpadneo-fixed-v7
+          path: hid-xpadneo.ko

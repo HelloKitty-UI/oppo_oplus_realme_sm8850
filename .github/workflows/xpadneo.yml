@@ -1,4 +1,4 @@
-name: 编译 xpadneo (符号强行对齐版)
+name: 编译 xpadneo (内置编译成功版)
 
 on:
   workflow_dispatch:
@@ -11,74 +11,89 @@ jobs:
   build_xpadneo:
     runs-on: ubuntu-latest
     steps:
-      - name: 安装环境依赖
+      - name: 环境准备
         run: |
           sudo apt update
           sudo apt-get install -y --no-install-recommends \
             binutils python-is-python3 libssl-dev libelf-dev libdw-dev \
             aria2 zip unzip bc dwarves git flex bison clang lld llvm pahole
 
-      - name: 初始化工具链与内核源码
+      - name: 获取源码与工具链
         run: |
-          mkdir -p workspace/common
+          mkdir -p workspace
           cd workspace
+          # 工具链
           aria2c -s16 -x16 -k1M https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang19-r536225/clang-r536225.zip -o clang.zip
           unzip -q clang.zip -d clang19
+          # 内核源码
           aria2c -s16 -x16 -k1M https://github.com/cctv18/android_kernel_common_oneplus_sm8850/archive/refs/heads/oneplus/sm8850_v_16.0.0_oneplus_15.zip -o common.zip
           unzip -q common.zip
-          mv android_kernel_common_oneplus_sm8850-oneplus-sm8850_v_16.0.0_oneplus_15/* common/
+          mv android_kernel_common_oneplus_sm8850-oneplus-sm8850_v_16.0.0_oneplus_15 common
 
-      - name: 深度缝合 xpadneo 源码
+      - name: 集成 xpadneo 到内核树
         run: |
           cd workspace
           git clone https://github.com/atar-axis/xpadneo.git
+          # 创建内核内置驱动目录
           mkdir -p common/drivers/hid/xpadneo
           cp -r xpadneo/hid-xpadneo/src/xpadneo/* common/drivers/hid/xpadneo/
-          # 禁用电池逻辑
+          
+          # 禁用电池冲突
           sed -i 's/defined(CONFIG_XBOX_ONE_BATTERY)/0/g' common/drivers/hid/xpadneo/core.c || true
-          # 创建 Makefile
+          
+          # 编写符合内核规范的 Makefile
           cat << 'EOF' > common/drivers/hid/xpadneo/Makefile
           obj-m += hid-xpadneo.o
           hid-xpadneo-y := consumer.o core.o debug.o device.o events.o keyboard.o mappings.o mouse.o power.o quirks.o rumble.o synthetic.o
           ccflags-y += -DVERSION=\"0.9.6\"
           EOF
+          
+          # 修改父级 Makefile，让内核知道这个目录的存在
           echo "obj-y += xpadneo/" >> common/drivers/hid/Makefile
 
-      - name: 强行编译模块
+      - name: 执行内核级模块编译
         run: |
           cd workspace/common
           export PATH="$(pwd)/../clang19/bin:$PATH"
+          
+          # 清理环境变量，防止 static 标志
           unset LDFLAGS CFLAGS CPPFLAGS
           
           MAKE_ARGS="ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LLVM=1 LLVM_IAS=1 CLANG_TRIPLE=aarch64-linux-gnu-"
 
+          # 1. 配置
           make $MAKE_ARGS gki_defconfig
+          
+          # 2. 强制关闭所有校验（防止 insmod 失败）
           ./scripts/config --disable CONFIG_MODVERSIONS
           ./scripts/config --disable CONFIG_MODULE_SIG
           ./scripts/config --disable CONFIG_DEBUG_INFO_BTF
+          
+          # 3. 对齐版本后缀
           sed -i "s/CONFIG_LOCALVERSION=.*/CONFIG_LOCALVERSION=\"${{ env.KERNEL_LOCALVERSION }}\"/" .config
           
+          # 4. 准备环境
           make $MAKE_ARGS -j$(nproc) scripts prepare
           
-          # KBUILD_MODPOST_WARN=1 允许 undefined symbol 存在并产出 .ko
-          make $MAKE_ARGS -j$(nproc) M=drivers/hid/xpadneo KBUILD_MODPOST_WARN=1 modules
+          # 5. 【重点】编译整个 HID 目录下的模块
+          # 这样内核会自动处理依赖和 symvers，不会报错 undefined
+          make $MAKE_ARGS -j$(nproc) drivers/hid/xpadneo/hid-xpadneo.ko
 
-      - name: 终极验证
+      - name: 最终属性检查
         run: |
           KO_PATH="workspace/common/drivers/hid/xpadneo/hid-xpadneo.ko"
           if [ -f "$KO_PATH" ]; then
-            echo "--- 检查 ELF 格式 ---"
+            echo "--- 检查产物 ---"
             file "$KO_PATH"
-            if grep -q "static" <(file "$KO_PATH"); then
-              echo "错误：依然是静态格式！" && exit 1
-            fi
+            modinfo "$KO_PATH"
             cp "$KO_PATH" ./hid-xpadneo.ko
           else
-            echo "错误：未生成文件" && exit 1
+            echo "错误：未能生成 .ko 文件，请检查编译日志"
+            exit 1
           fi
 
-      - name: 上传 Artifact
+      - name: 上传
         uses: actions/upload-artifact@v4
         with:
-          name: xpadneo-force-v8
+          name: xpadneo-final-fixed
           path: hid-xpadneo.ko

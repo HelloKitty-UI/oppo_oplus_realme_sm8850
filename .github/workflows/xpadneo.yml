@@ -1,103 +1,122 @@
-name: 内核全量构建并提取 xpadneo 模块
+name: 编译 xpadneo (APatch KPM 转换版)
 
 on:
   workflow_dispatch:
 
 env:
   TZ: Asia/Shanghai
+  # 必须与你手机执行 uname -r 后的结果完全一致
   KERNEL_LOCALVERSION: "-android16-5-g188c695beb6d-ab14367805-4k"
 
 jobs:
-  build:
+  build_xpadneo_kpm:
     runs-on: ubuntu-latest
     steps:
-      - name: 环境准备
+      - name: 安装环境依赖
         run: |
           sudo apt update
           sudo apt-get install -y --no-install-recommends \
             binutils python-is-python3 libssl-dev libelf-dev libdw-dev \
             aria2 zip unzip bc dwarves git flex bison clang lld llvm pahole
 
-      - name: 获取工具链与内核源码
+      - name: 初始化工具链与内核源码
         run: |
-          mkdir -p workspace/common
+          mkdir -p workspace
           cd workspace
-          # 下载 Clang 19
+          # 下载专用 Clang 19 工具链
           aria2c -s16 -x16 -k1M https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang19-r536225/clang-r536225.zip -o clang.zip
           unzip -q clang.zip -d clang19
-          # 下载内核
+          
+          # 下载一加内核源码
           aria2c -s16 -x16 -k1M https://github.com/cctv18/android_kernel_common_oneplus_sm8850/archive/refs/heads/oneplus/sm8850_v_16.0.0_oneplus_15.zip -o common.zip
           unzip -q common.zip
-          mv android_kernel_common_oneplus_sm8850-oneplus-sm8850_v_16.0.0_oneplus_15/* common/
+          mv android_kernel_common_oneplus_sm8850-oneplus-sm8850_v_16.0.0_oneplus_15 common
 
-      - name: 将 xpadneo 注入内核血液
+      - name: 深度缝合并解除符号限制
         run: |
           cd workspace
           git clone https://github.com/atar-axis/xpadneo.git
+          
           mkdir -p common/drivers/hid/xpadneo
           cp -r xpadneo/hid-xpadneo/src/xpadneo/* common/drivers/hid/xpadneo/
           
-          # 1. 编写内核标准的 Kconfig (让配置菜单能看到它)
-          cat << 'EOF' > common/drivers/hid/xpadneo/Kconfig
-          config HID_XPADNEO
-          	tristate "Xpadneo Xbox One S/X controller support"
-          	depends on HID
-          	help
-          	  Support for Xbox One S/X controllers via Bluetooth.
-          EOF
-
-          # 2. 编写标准的 Makefile
-          cat << 'EOF' > common/drivers/hid/xpadneo/Makefile
-          obj-$(CONFIG_HID_XPADNEO) += hid-xpadneo.o
+          # 【关键】解除 static 限制，使 KPM 能找到初始化函数
+          # 将 xpad_init 改为非静态，并重命名以防冲突
+          cd common/drivers/hid/xpadneo
+          sed -i 's/static int __init xpad_init/int xpadneo_init_kpm/g' core.c
+          sed -i 's/static void __exit xpad_exit/void xpadneo_exit_kpm/g' core.c
+          
+          # 禁用电池上报
+          sed -i 's/defined(CONFIG_XBOX_ONE_BATTERY)/0/g' core.c || true
+          
+          # 创建 Makefile
+          cat << 'EOF' > Makefile
+          XPADNEO_VERSION := "0.9.6"
+          ccflags-y += -DVERSION=$(XPADNEO_VERSION)
+          obj-m += hid-xpadneo.o
           hid-xpadneo-y := consumer.o core.o debug.o device.o events.o keyboard.o mappings.o mouse.o power.o quirks.o rumble.o synthetic.o
-          ccflags-y += -DVERSION=\"0.9.6\"
           EOF
 
-          # 3. 注册到父级目录
-          echo "source \"drivers/hid/xpadneo/Kconfig\"" >> common/drivers/hid/Kconfig
-          echo "obj-\$(CONFIG_HID_XPADNEO) += xpadneo/" >> common/drivers/hid/Makefile
+          # 将驱动目录加入内核扫描
+          echo "obj-y += xpadneo/" >> ../Makefile
 
-      - name: 全量编译内核模块
+      - name: 编译 vmlinux 与 模块
         run: |
           cd workspace/common
           export PATH="$(pwd)/../clang19/bin:$PATH"
-          unset LDFLAGS CFLAGS CPPFLAGS
           
-          MAKE_ARGS="ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LLVM=1 LLVM_IAS=1 CLANG_TRIPLE=aarch64-linux-gnu-"
+          export MAKE_ARGS="ARCH=arm64 \
+                     CROSS_COMPILE=aarch64-linux-gnu- \
+                     LLVM=1 \
+                     LLVM_IAS=1 \
+                     CLANG_TRIPLE=aarch64-linux-gnu-"
 
-          # 1. 生成基础配置
           make $MAKE_ARGS gki_defconfig
           
-          # 2. 【核心】强行开启 XPADNEO 模块开关 (m 代表编译为独立模块)
-          ./scripts/config --module CONFIG_HID_XPADNEO
+          # 禁用 BTF 以加快编译并减少错误
+          scripts/config --disable CONFIG_DEBUG_INFO_BTF
+          scripts/config --disable CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT
           
-          # 3. 禁用多余校验
-          ./scripts/config --disable CONFIG_MODVERSIONS
-          ./scripts/config --disable CONFIG_MODULE_SIG
-          ./scripts/config --disable CONFIG_DEBUG_INFO_BTF
-          
-          # 4. 版本对齐
           sed -i "s/CONFIG_LOCALVERSION=.*/CONFIG_LOCALVERSION=\"${{ env.KERNEL_LOCALVERSION }}\"/" .config
           
-          # 5. 开始全量编译 (这一步会生成 Module.symvers)
-          # 我们只需要编译到 modules 阶段即可，不需要生成整个 Image
-          make $MAKE_ARGS -j$(nproc) modules
+          # 【关键】不仅编译 modules，还要编译出 vmlinux
+          # 这步可能耗时较长 (15-30分钟)
+          make $MAKE_ARGS -j$(nproc) vmlinux modules
 
-      - name: 提取并检查
+      - name: 构建 KPM 模块
         run: |
-          KO_PATH="workspace/common/drivers/hid/xpadneo/hid-xpadneo.ko"
-          if [ -f "$KO_PATH" ]; then
-            echo "--- 模块信息 ---"
-            file "$KO_PATH"
-            modinfo "$KO_PATH"
-            cp "$KO_PATH" ./hid-xpadneo.ko
-          else
-            echo "错误：模块未生成，检查编译日志"
-            exit 1
-          fi
+          cd workspace/common
+          
+          # 1. 下载 APatch kpatch 工具
+          curl -L https://github.com/bmax121/APatch/releases/latest/download/kpatch -o kpatch
+          chmod +x kpatch
+          
+          # 2. 创建 KPM 入口引导文件
+          cat << 'EOF' > kpm_stub.c
+          #include <linux/module.h>
+          extern int xpadneo_init_kpm(void);
+          extern void xpadneo_exit_kpm(void);
+          int kpm_init(void) { return xpadneo_init_kpm(); }
+          void kpm_exit(void) { xpadneo_exit_kpm(); }
+          module_init(kpm_init);
+          module_exit(kpm_exit);
+          EOF
+          
+          # 3. 编译引导文件为 .o
+          export PATH="$(pwd)/../clang19/bin:$PATH"
+          $PATH/clang -target aarch64-linux-gnu -I./include -I./arch/arm64/include -D__KERNEL__ -c kpm_stub.c -o kpm_stub.o
 
-      - name: 上传
+          # 4. 使用 kpatch 工具合成 .kpm
+          # 它会读取 vmlinux 里的地址，将所有 .o 缝合成一个补丁
+          ./kpatch build \
+            --arch arm64 \
+            --vmlinux ./vmlinux \
+            --config .config \
+            --output xpadneo.kpm \
+            drivers/hid/xpadneo/*.o kpm_stub.o
+
+      - name: 上传 KPM 文件
         uses: actions/upload-artifact@v4
         with:
-          name: xpadneo-full-kernel-build
-          path: hid-xpadneo.ko
+          name: xpadneo-apatch-kpm
+          path: workspace/common/xpadneo.kpm

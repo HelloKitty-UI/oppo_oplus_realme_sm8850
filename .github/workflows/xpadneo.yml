@@ -1,11 +1,10 @@
-name: 编译 xpadneo (APatch KPM 高速缓存版)
+name: 编译 xpadneo (第二步：利用缓存调试 KPM)
 
 on:
   workflow_dispatch:
 
 env:
   TZ: Asia/Shanghai
-  # 必须与你手机执行 uname -r 后的结果完全一致
   KERNEL_LOCALVERSION: "-android16-5-g188c695beb6d-ab14367805-4k"
 
 jobs:
@@ -26,16 +25,14 @@ jobs:
         run: |
           mkdir -p workspace
           cd workspace
-          # 下载专用 Clang 19 工具链
           aria2c -s16 -x16 -k1M https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang19-r536225/clang-r536225.zip -o clang.zip
           unzip -q clang.zip -d clang19
           
-          # 下载内核源码
           aria2c -s16 -x16 -k1M https://github.com/cctv18/android_kernel_common_oneplus_sm8850/archive/refs/heads/oneplus/sm8850_v_16.0.0_oneplus_15.zip -o common.zip
           unzip -q common.zip
           mv android_kernel_common_oneplus_sm8850-oneplus-sm8850_v_16.0.0_oneplus_15 common
 
-      - name: 设置内核编译缓存 (vmlinux Cache)
+      - name: 读取内核编译缓存
         id: cache-vmlinux
         uses: actions/cache@v4
         with:
@@ -45,30 +42,24 @@ jobs:
             workspace/common/include
             workspace/common/arch/arm64/include
             workspace/common/scripts
-          # Key 绑定到版本号，版本变了才重新全量编译
           key: vmlinux-v1-${{ env.KERNEL_LOCALVERSION }}
 
-      - name: 全量编译 vmlinux (仅在无缓存时执行)
+      - name: 全量编译 (由于缓存存在，此步将被跳过)
         if: steps.cache-vmlinux.outputs.cache-hit != 'true'
         run: |
           cd workspace/common
           export PATH="$(pwd)/../clang19/bin:$PATH"
           export MAKE_ARGS="ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LLVM=1 LLVM_IAS=1 CLANG_TRIPLE=aarch64-linux-gnu-"
-
           make $MAKE_ARGS gki_defconfig
           scripts/config --disable CONFIG_DEBUG_INFO_BTF
           scripts/config --disable CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT
           sed -i "s/CONFIG_LOCALVERSION=.*/CONFIG_LOCALVERSION=\"${{ env.KERNEL_LOCALVERSION }}\"/" .config
-          
-          # 编译出 vmlinux 本体
-          make $MAKE_ARGS -j$(nproc) vmlinux modules
+          make $MAKE_ARGS -j$(nproc) vmlinux
 
-      - name: 深度缝合驱动并增量编译驱动目标
+      - name: 准备驱动源码并增量编译
         run: |
           cd workspace
-          # 如果目录已存在则跳过 clone
           [ -d "xpadneo" ] || git clone https://github.com/atar-axis/xpadneo.git
-          
           mkdir -p common/drivers/hid/xpadneo
           cp -r xpadneo/hid-xpadneo/src/xpadneo/* common/drivers/hid/xpadneo/
           
@@ -78,7 +69,6 @@ jobs:
           sed -i 's/static void __exit xpad_exit/void xpadneo_exit_kpm/g' core.c
           sed -i 's/defined(CONFIG_XBOX_ONE_BATTERY)/0/g' core.c || true
           
-          # 创建 Makefile
           cat << 'EOF' > Makefile
           XPADNEO_VERSION := "0.9.6"
           ccflags-y += -DVERSION=$(XPADNEO_VERSION)
@@ -86,17 +76,17 @@ jobs:
           hid-xpadneo-y := consumer.o core.o debug.o device.o events.o keyboard.o mappings.o mouse.o power.o quirks.o rumble.o synthetic.o
           EOF
 
-          # 增量编译驱动的 .o 文件 (极快)
-          cd ../../../
+          # 只编译驱动目标文件
+          cd ../../../common
           export PATH="$(pwd)/../clang19/bin:$PATH"
           export MAKE_ARGS="ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LLVM=1 LLVM_IAS=1 CLANG_TRIPLE=aarch64-linux-gnu-"
           make $MAKE_ARGS -j$(nproc) M=drivers/hid/xpadneo modules
 
-      - name: 构建 KPM 补丁 (修复 IS_ENABLED 报错)
+      - name: 构建 KPM 补丁 (快速调试)
         run: |
           cd workspace/common
           
-          # 1. 载入 kptools (保持不变)
+          # 1. 载入 kptools (确保仓库根目录有这个文件)
           if [ -f "../../kptools" ]; then
             cp "../../kptools" ./kptools
             chmod +x ./kptools
@@ -105,42 +95,60 @@ jobs:
             exit 1
           fi
           
-          # 2. 创建引导 stub (保持不变)
+          # 2. 编写极其简化的引导 Stub，避免复杂的内核头文件报错
           cat << 'EOF' > kpm_stub.c
-          #include <linux/module.h>
+          #define __KERNEL__
+          #include <linux/types.h>
+          
+          // 声明外部函数
           extern int xpadneo_init_kpm(void);
           extern void xpadneo_exit_kpm(void);
+          
+          // 强制定义内核导出宏
           int kpm_init(void) { return xpadneo_init_kpm(); }
           void kpm_exit(void) { xpadneo_exit_kpm(); }
-          module_init(kpm_init);
-          module_exit(kpm_exit);
+          
+          // 模拟内核模块入口
+          typedef int (*init_t)(void);
+          typedef void (*exit_t)(void);
+          init_t _init = kpm_init;
+          exit_t _exit = kpm_exit;
           EOF
           
-          # 3. 编译 Stub (增加强制包含 autoconf.h)
+          # 3. 编译 Stub 目标文件
           export CLANG_PATH="$(pwd)/../clang19/bin/clang"
           $CLANG_PATH -target aarch64-linux-gnu \
-            -march=armv8-a \
             -I./include \
             -I./include/uapi \
             -I./arch/arm64/include \
             -I./arch/arm64/include/uapi \
             -I./arch/arm64/include/generated \
-            -I./arch/arm64/include/generated/uapi \
             -I./include/generated \
-            -I./include/generated/uapi \
-            -D__KERNEL__ -D__AARCH64__ \
-            -include ./include/generated/autoconf.h \
-            -O2 -c kpm_stub.c -o kpm_stub.o
+            -D__KERNEL__ -D__AARCH64__ -O2 -c kpm_stub.c -o kpm_stub.o
 
-          # 4. 合成 KPM (保持不变)
+          # 4. 合成 KPM
+          # 如果这里报错 symbol not found，尝试把 *.o 展开
           ./kptools kpm build \
             --arch arm64 \
             --vmlinux ./vmlinux \
             --config .config \
             --output xpadneo.kpm \
-            drivers/hid/xpadneo/*.o kpm_stub.o
-      - name: 上传 KPM 结果
+            drivers/hid/xpadneo/consumer.o \
+            drivers/hid/xpadneo/core.o \
+            drivers/hid/xpadneo/debug.o \
+            drivers/hid/xpadneo/device.o \
+            drivers/hid/xpadneo/events.o \
+            drivers/hid/xpadneo/keyboard.o \
+            drivers/hid/xpadneo/mappings.o \
+            drivers/hid/xpadneo/mouse.o \
+            drivers/hid/xpadneo/power.o \
+            drivers/hid/xpadneo/quirks.o \
+            drivers/hid/xpadneo/rumble.o \
+            drivers/hid/xpadneo/synthetic.o \
+            kpm_stub.o
+
+      - name: 提取并上传 KPM
         uses: actions/upload-artifact@v4
         with:
-          name: xpadneo-apatch-kpm
+          name: xpadneo-kpm
           path: workspace/common/xpadneo.kpm

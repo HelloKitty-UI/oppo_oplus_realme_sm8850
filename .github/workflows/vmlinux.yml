@@ -1,0 +1,81 @@
+name: 编译 xpadneo (第一步：建立内核缓存)
+
+on:
+  workflow_dispatch:
+
+env:
+  TZ: Asia/Shanghai
+  # 必须与你手机执行 uname -r 后的结果完全一致
+  KERNEL_LOCALVERSION: "-android16-5-g188c695beb6d-ab14367805-4k"
+
+jobs:
+  build_cache:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出仓库代码
+        uses: actions/checkout@v4
+
+      - name: 安装环境依赖
+        run: |
+          sudo apt update
+          sudo apt-get install -y --no-install-recommends \
+            binutils python-is-python3 libssl-dev libelf-dev libdw-dev \
+            aria2 zip unzip bc dwarves git flex bison clang lld llvm pahole
+
+      - name: 初始化工具链与内核源码
+        run: |
+          mkdir -p workspace
+          cd workspace
+          # 下载专用 Clang 19 工具链
+          aria2c -s16 -x16 -k1M https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang19-r536225/clang-r536225.zip -o clang.zip
+          unzip -q clang.zip -d clang19
+          
+          # 下载一加内核源码
+          aria2c -s16 -x16 -k1M https://github.com/cctv18/android_kernel_common_oneplus_sm8850/archive/refs/heads/oneplus/sm8850_v_16.0.0_oneplus_15.zip -o common.zip
+          unzip -q common.zip
+          mv android_kernel_common_oneplus_sm8850-oneplus-sm8850_v_16.0.0_oneplus_15 common
+
+      - name: 设置内核编译缓存 (vmlinux Cache)
+        id: cache-vmlinux
+        uses: actions/cache@v4
+        with:
+          path: |
+            workspace/common/vmlinux
+            workspace/common/.config
+            workspace/common/include
+            workspace/common/arch/arm64/include
+            workspace/common/scripts
+          # Key 绑定到版本号
+          key: vmlinux-v1-${{ env.KERNEL_LOCALVERSION }}
+
+      - name: 全量编译 vmlinux (建立缓存)
+        if: steps.cache-vmlinux.outputs.cache-hit != 'true'
+        run: |
+          cd workspace/common
+          export PATH="$(pwd)/../clang19/bin:$PATH"
+          export MAKE_ARGS="ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LLVM=1 LLVM_IAS=1 CLANG_TRIPLE=aarch64-linux-gnu-"
+
+          make $MAKE_ARGS gki_defconfig
+          scripts/config --disable CONFIG_DEBUG_INFO_BTF
+          scripts/config --disable CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT
+          sed -i "s/CONFIG_LOCALVERSION=.*/CONFIG_LOCALVERSION=\"${{ env.KERNEL_LOCALVERSION }}\"/" .config
+          
+          # 编译出 vmlinux 本体
+          make $MAKE_ARGS -j$(nproc) vmlinux
+
+      - name: 调试：确认文件位置
+        run: |
+          echo "--- 检查 vmlinux 是否存在 ---"
+          ls -lh workspace/common/vmlinux || echo "未找到 vmlinux"
+          echo "--- 检查配置文件 ---"
+          ls -lh workspace/common/.config || echo "未找到 .config"
+
+      - name: 强制成功以触发缓存保存
+        run: |
+          echo "内核编译已完成（或已从缓存恢复）。"
+          echo "现在强制退出，让 GitHub 保存当前的编译产物..."
+          exit 0
+
+      # 下面的步骤在缓存建立阶段会被跳过
+      - name: 构建 KPM 补丁 (占位)
+        run: echo "此步骤在第一步运行中不会执行"

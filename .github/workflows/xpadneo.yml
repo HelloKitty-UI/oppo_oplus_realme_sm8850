@@ -44,7 +44,7 @@ jobs:
             workspace/common/scripts
           key: vmlinux-v1-${{ env.KERNEL_LOCALVERSION }}
 
-      - name: 全量编译 (由于缓存存在，此步将被跳过)
+      - name: 全量编译 (缓存命中则跳过)
         if: steps.cache-vmlinux.outputs.cache-hit != 'true'
         run: |
           cd workspace/common
@@ -58,12 +58,13 @@ jobs:
 
       - name: 准备驱动源码并增量编译
         run: |
+          # 1. 准备源码
           cd workspace
           [ -d "xpadneo" ] || git clone https://github.com/atar-axis/xpadneo.git
           mkdir -p common/drivers/hid/xpadneo
           cp -r xpadneo/hid-xpadneo/src/xpadneo/* common/drivers/hid/xpadneo/
           
-          # 解除 static 限制
+          # 2. 解除 static 限制
           cd common/drivers/hid/xpadneo
           sed -i 's/static int __init xpad_init/int xpadneo_init_kpm/g' core.c
           sed -i 's/static void __exit xpad_exit/void xpadneo_exit_kpm/g' core.c
@@ -76,17 +77,19 @@ jobs:
           hid-xpadneo-y := consumer.o core.o debug.o device.o events.o keyboard.o mappings.o mouse.o power.o quirks.o rumble.o synthetic.o
           EOF
 
-          # 只编译驱动目标文件
-          cd ../../../common
+          # 3. 增量编译 (修正后的路径逻辑)
+          cd ../../../common  # 此时回到 workspace/common
           export PATH="$(pwd)/../clang19/bin:$PATH"
           export MAKE_ARGS="ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LLVM=1 LLVM_IAS=1 CLANG_TRIPLE=aarch64-linux-gnu-"
+          
+          # 显式指向 M= 目录
           make $MAKE_ARGS -j$(nproc) M=drivers/hid/xpadneo modules
 
-      - name: 构建 KPM 补丁 (快速调试)
+      - name: 构建 KPM 补丁
         run: |
           cd workspace/common
           
-          # 1. 载入 kptools (确保仓库根目录有这个文件)
+          # 1. 载入 kptools
           if [ -f "../../kptools" ]; then
             cp "../../kptools" ./kptools
             chmod +x ./kptools
@@ -95,27 +98,18 @@ jobs:
             exit 1
           fi
           
-          # 2. 编写极其简化的引导 Stub，避免复杂的内核头文件报错
+          # 2. 编写引导 Stub
           cat << 'EOF' > kpm_stub.c
-          #define __KERNEL__
-          #include <linux/types.h>
-          
-          // 声明外部函数
+          #include <linux/module.h>
           extern int xpadneo_init_kpm(void);
           extern void xpadneo_exit_kpm(void);
-          
-          // 强制定义内核导出宏
           int kpm_init(void) { return xpadneo_init_kpm(); }
           void kpm_exit(void) { xpadneo_exit_kpm(); }
-          
-          // 模拟内核模块入口
-          typedef int (*init_t)(void);
-          typedef void (*exit_t)(void);
-          init_t _init = kpm_init;
-          exit_t _exit = kpm_exit;
+          module_init(kpm_init);
+          module_exit(kpm_exit);
           EOF
           
-          # 3. 编译 Stub 目标文件
+          # 3. 编译 Stub 目标文件 (使用更鲁棒的包含路径)
           export CLANG_PATH="$(pwd)/../clang19/bin/clang"
           $CLANG_PATH -target aarch64-linux-gnu \
             -I./include \
@@ -127,7 +121,7 @@ jobs:
             -D__KERNEL__ -D__AARCH64__ -O2 -c kpm_stub.c -o kpm_stub.o
 
           # 4. 合成 KPM
-          # 如果这里报错 symbol not found，尝试把 *.o 展开
+          # 展开 *.o 文件，确保链接顺序无误
           ./kptools kpm build \
             --arch arm64 \
             --vmlinux ./vmlinux \

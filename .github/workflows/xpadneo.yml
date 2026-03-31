@@ -92,20 +92,20 @@ jobs:
           export MAKE_ARGS="ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LLVM=1 LLVM_IAS=1 CLANG_TRIPLE=aarch64-linux-gnu-"
           make $MAKE_ARGS -j$(nproc) M=drivers/hid/xpadneo modules
 
-      - name: 构建 KPM 补丁 (快速构建区)
+      - name: 构建 KPM 补丁 (修复 IS_ENABLED 报错)
         run: |
           cd workspace/common
           
-          # 1. 载入仓库里的 kptools
+          # 1. 载入 kptools (保持不变)
           if [ -f "../../kptools" ]; then
             cp "../../kptools" ./kptools
             chmod +x ./kptools
           else
-            echo "错误：请确保仓库根目录有 kptools (即 kptools-linux)"
+            echo "错误：未发现 kptools 文件！"
             exit 1
           fi
           
-          # 2. 创建引导 stub
+          # 2. 创建引导 stub (保持不变)
           cat << 'EOF' > kpm_stub.c
           #include <linux/module.h>
           extern int xpadneo_init_kpm(void);
@@ -116,9 +116,10 @@ jobs:
           module_exit(kpm_exit);
           EOF
           
-          # 3. 编译 Stub (修复头文件路径)
+          # 3. 编译 Stub (增加强制包含 autoconf.h)
           export CLANG_PATH="$(pwd)/../clang19/bin/clang"
           $CLANG_PATH -target aarch64-linux-gnu \
+            -march=armv8-a \
             -I./include \
             -I./include/uapi \
             -I./arch/arm64/include \
@@ -127,16 +128,17 @@ jobs:
             -I./arch/arm64/include/generated/uapi \
             -I./include/generated \
             -I./include/generated/uapi \
-            -D__KERNEL__ -D__AARCH64__ -O2 -c kpm_stub.c -o kpm_stub.o
+            -D__KERNEL__ -D__AARCH64__ \
+            -include ./include/generated/autoconf.h \
+            -O2 -c kpm_stub.c -o kpm_stub.o
 
-          # 4. 合成 KPM
+          # 4. 合成 KPM (保持不变)
           ./kptools kpm build \
             --arch arm64 \
             --vmlinux ./vmlinux \
             --config .config \
             --output xpadneo.kpm \
             drivers/hid/xpadneo/*.o kpm_stub.o
-
       - name: 上传 KPM 结果
         uses: actions/upload-artifact@v4
         with:

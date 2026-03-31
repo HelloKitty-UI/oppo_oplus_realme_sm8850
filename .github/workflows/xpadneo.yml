@@ -1,4 +1,4 @@
-name: 编译 xpadneo (第二步：利用缓存调试 KPM - 最终路径版)
+name: 编译 xpadneo (APatch KPM 官方原生链接版)
 
 on:
   workflow_dispatch:
@@ -44,103 +44,83 @@ jobs:
             workspace/common/scripts
           key: vmlinux-v1-${{ env.KERNEL_LOCALVERSION }}
 
-      - name: 全量编译 (缓存命中则跳过)
-        if: steps.cache-vmlinux.outputs.cache-hit != 'true'
-        run: |
-          cd workspace/common
-          export PATH="$(pwd)/../clang19/bin:$PATH"
-          export MAKE_ARGS="ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LLVM=1 LLVM_IAS=1 CLANG_TRIPLE=aarch64-linux-gnu-"
-          make $MAKE_ARGS gki_defconfig
-          scripts/config --disable CONFIG_DEBUG_INFO_BTF
-          scripts/config --disable CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT
-          sed -i "s/CONFIG_LOCALVERSION=.*/CONFIG_LOCALVERSION=\"${{ env.KERNEL_LOCALVERSION }}\"/" .config
-          make $MAKE_ARGS -j$(nproc) vmlinux
-
-      - name: 准备驱动源码并编译目标文件
+      - name: 准备驱动源码并编译为 .o 文件
         run: |
           ROOT_DIR=$(pwd)
           KERNEL_DIR=$ROOT_DIR/workspace/common
-          CLANG_BIN=$ROOT_DIR/workspace/clang19/bin
           
           cd workspace
           [ -d "xpadneo" ] || git clone https://github.com/atar-axis/xpadneo.git
-          
           XPAD_DIR=$KERNEL_DIR/drivers/hid/xpadneo
           mkdir -p $XPAD_DIR
           cp -r xpadneo/hid-xpadneo/src/xpadneo/* $XPAD_DIR/
+
+          # 创建符合 KPM 规范的 entry.c
+          # 注意：这里手动定义 KPM 宏，模拟 <kpmodule.h>
+          cat << 'EOF' > $XPAD_DIR/kpm_main.c
+          #define KPM_INFO(name, value) \
+              static const char __kpm_##name[] __attribute__((used, section(".kpm_info"))) = #name "=" value
           
-          cd $XPAD_DIR
-          # 修改函数签名，确保 KPM 能调用
-          sed -i 's/static int __init xpad_init/int xpadneo_init_kpm/g' core.c
-          sed -i 's/static void __exit xpad_exit/void xpadneo_exit_kpm/g' core.c
-          sed -i 's/defined(CONFIG_XBOX_ONE_BATTERY)/0/g' core.c || true
-          
-          cat << 'EOF' > Makefile
-          XPADNEO_VERSION := "0.9.6"
-          ccflags-y += -DVERSION=$(XPADNEO_VERSION)
-          obj-m += hid-xpadneo.o
-          hid-xpadneo-y := consumer.o core.o debug.o device.o events.o keyboard.o mappings.o mouse.o power.o quirks.o rumble.o synthetic.o
+          KPM_NAME("xpadneo");
+          KPM_VERSION("0.9.6");
+          KPM_LICENSE("GPL v2");
+          KPM_AUTHOR("atar-axis");
+          KPM_DESCRIPTION("Xbox Controller Driver via APatch");
+
+          extern int xpadneo_init(void);
+          extern void xpadneo_exit(void);
+
+          // 模拟 KPM_INIT / KPM_EXIT 的底层实现（根据链接脚本逻辑）
+          static long kpm_init_wrapper(const char *args, const char *event, void *res) {
+              return (long)xpadneo_init();
+          }
+          static long kpm_exit_wrapper(void *res) {
+              xpadneo_exit();
+              return 0;
+          }
+
+          // 将函数指针放入 APatch 识别的特定段
+          static void* __init_ptr __attribute__((used, section(".kpm_init"))) = kpm_init_wrapper;
+          static void* __exit_ptr __attribute__((used, section(".kpm_exit"))) = kpm_exit_wrapper;
           EOF
 
+          # 修改原 core.c 导出初始化函数
+          sed -i 's/static int __init xpad_init/int xpadneo_init/g' $XPAD_DIR/core.c
+          sed -i 's/static void __exit xpad_exit/void xpadneo_exit/g' $XPAD_DIR/core.c
+
+          # 编译所有 .o 文件 (使用内核的编译参数但只要 .o)
           cd $KERNEL_DIR
-          export PATH="$CLANG_BIN:$PATH"
+          export PATH="$ROOT_DIR/workspace/clang19/bin:$PATH"
           export MAKE_ARGS="ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LLVM=1 LLVM_IAS=1 CLANG_TRIPLE=aarch64-linux-gnu-"
           
-          # 编译驱动 .o 文件，忽略最后的链接错误
+          cat << 'EOF' > $XPAD_DIR/Makefile
+          obj-y := kpm_main.o consumer.o core.o debug.o device.o events.o keyboard.o mappings.o mouse.o power.o quirks.o rumble.o synthetic.o
+          ccflags-y += -DVERSION=\"0.9.6\" -I$(src)
+          EOF
+
+          # 只编译出目标文件，不链接
           make $MAKE_ARGS -j$(nproc) M=drivers/hid/xpadneo modules || true
 
-      - name: 构建 KPM 补丁
+      - name: 使用 LLVM 链接生成 .kpm
         run: |
           ROOT_DIR=$(pwd)
-          KERNEL_DIR=$ROOT_DIR/workspace/common
-          cd $KERNEL_DIR
+          XPAD_OBJ_DIR="workspace/common/drivers/hid/xpadneo"
+          LD="$ROOT_DIR/workspace/clang19/bin/ld.lld"
+          STRIP="$ROOT_DIR/workspace/clang19/bin/llvm-strip"
           
-          if [ -f "$ROOT_DIR/kptools" ]; then
-            cp "$ROOT_DIR/kptools" ./kptools
-            chmod +x ./kptools
-          else
-            echo "错误：未发现 kptools 文件！"
-            exit 1
-          fi
+          cd $XPAD_OBJ_DIR
           
-          # 1. 编写“零依赖”Stub 文件
-          # 绕过所有内核头文件，直接声明 KPM 接口
-          cat << 'EOF' > kpm_stub.c
-          typedef int (*init_ptr)(void);
-          typedef void (*exit_ptr)(void);
-
-          extern int xpadneo_init_kpm(void);
-          extern void xpadneo_exit_kpm(void);
-
-          // KPM 期望的导出符号名
-          init_ptr _kpm_init = xpadneo_init_kpm;
-          exit_ptr _kpm_exit = xpadneo_exit_kpm;
-          EOF
+          # 执行部分链接 (Relocatable Link)
+          # 把所有驱动 .o 文件链接成一个单体
+          $LD -r -o xpadneo.kpm \
+            kpm_main.o consumer.o core.o debug.o device.o events.o \
+            keyboard.o mappings.o mouse.o power.o quirks.o rumble.o synthetic.o
           
-          # 2. 极简编译 Stub (无需任何 -I 路径)
-          export CLANG_PATH="$ROOT_DIR/workspace/clang19/bin/clang"
-          $CLANG_PATH -target aarch64-linux-gnu -O2 -c kpm_stub.c -o kpm_stub.o
-
-          # 3. 合成 KPM
-          # 将所有生成的 .o 文件合成最终补丁
-          ./kptools kpm build \
-            --arch arm64 \
-            --vmlinux ./vmlinux \
-            --config .config \
-            --output xpadneo.kpm \
-            drivers/hid/xpadneo/consumer.o \
-            drivers/hid/xpadneo/core.o \
-            drivers/hid/xpadneo/debug.o \
-            drivers/hid/xpadneo/device.o \
-            drivers/hid/xpadneo/events.o \
-            drivers/hid/xpadneo/keyboard.o \
-            drivers/hid/xpadneo/mappings.o \
-            drivers/hid/xpadneo/mouse.o \
-            drivers/hid/xpadneo/power.o \
-            drivers/hid/xpadneo/quirks.o \
-            drivers/hid/xpadneo/rumble.o \
-            drivers/hid/xpadneo/synthetic.o \
-            kpm_stub.o
+          # 清除符号，减小体积
+          $STRIP -g --strip-unneeded xpadneo.kpm
+          
+          cp xpadneo.kpm $ROOT_DIR/workspace/common/
+          echo "KPM 链接完成！"
 
       - name: 提取并上传 KPM
         uses: actions/upload-artifact@v4

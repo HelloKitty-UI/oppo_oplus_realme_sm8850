@@ -1,4 +1,4 @@
-name: 编译 xpadneo (APatch KPM 终极版)
+name: 编译 xpadneo (APatch KPM 高速缓存版)
 
 on:
   workflow_dispatch:
@@ -30,28 +30,55 @@ jobs:
           aria2c -s16 -x16 -k1M https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang19-r536225/clang-r536225.zip -o clang.zip
           unzip -q clang.zip -d clang19
           
-          # 下载内核源码 (sm8850/6.12)
+          # 下载内核源码
           aria2c -s16 -x16 -k1M https://github.com/cctv18/android_kernel_common_oneplus_sm8850/archive/refs/heads/oneplus/sm8850_v_16.0.0_oneplus_15.zip -o common.zip
           unzip -q common.zip
           mv android_kernel_common_oneplus_sm8850-oneplus-sm8850_v_16.0.0_oneplus_15 common
 
-      - name: 深度缝合并解除符号限制
+      - name: 设置内核编译缓存 (vmlinux Cache)
+        id: cache-vmlinux
+        uses: actions/cache@v4
+        with:
+          path: |
+            workspace/common/vmlinux
+            workspace/common/.config
+            workspace/common/include
+            workspace/common/arch/arm64/include
+            workspace/common/scripts
+          # Key 绑定到版本号，版本变了才重新全量编译
+          key: vmlinux-v1-${{ env.KERNEL_LOCALVERSION }}
+
+      - name: 全量编译 vmlinux (仅在无缓存时执行)
+        if: steps.cache-vmlinux.outputs.cache-hit != 'true'
+        run: |
+          cd workspace/common
+          export PATH="$(pwd)/../clang19/bin:$PATH"
+          export MAKE_ARGS="ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LLVM=1 LLVM_IAS=1 CLANG_TRIPLE=aarch64-linux-gnu-"
+
+          make $MAKE_ARGS gki_defconfig
+          scripts/config --disable CONFIG_DEBUG_INFO_BTF
+          scripts/config --disable CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT
+          sed -i "s/CONFIG_LOCALVERSION=.*/CONFIG_LOCALVERSION=\"${{ env.KERNEL_LOCALVERSION }}\"/" .config
+          
+          # 编译出 vmlinux 本体
+          make $MAKE_ARGS -j$(nproc) vmlinux modules
+
+      - name: 深度缝合驱动并增量编译驱动目标
         run: |
           cd workspace
-          git clone https://github.com/atar-axis/xpadneo.git
+          # 如果目录已存在则跳过 clone
+          [ -d "xpadneo" ] || git clone https://github.com/atar-axis/xpadneo.git
           
           mkdir -p common/drivers/hid/xpadneo
           cp -r xpadneo/hid-xpadneo/src/xpadneo/* common/drivers/hid/xpadneo/
           
-          # 【核心】解除 static 限制，使 KPM 引导头能访问初始化函数
+          # 解除 static 限制
           cd common/drivers/hid/xpadneo
           sed -i 's/static int __init xpad_init/int xpadneo_init_kpm/g' core.c
           sed -i 's/static void __exit xpad_exit/void xpadneo_exit_kpm/g' core.c
-          
-          # 禁用电池上报 (避免冲突)
           sed -i 's/defined(CONFIG_XBOX_ONE_BATTERY)/0/g' core.c || true
           
-          # 创建树内 Makefile
+          # 创建 Makefile
           cat << 'EOF' > Makefile
           XPADNEO_VERSION := "0.9.6"
           ccflags-y += -DVERSION=$(XPADNEO_VERSION)
@@ -59,47 +86,26 @@ jobs:
           hid-xpadneo-y := consumer.o core.o debug.o device.o events.o keyboard.o mappings.o mouse.o power.o quirks.o rumble.o synthetic.o
           EOF
 
-          # 将驱动目录加入内核扫描
-          echo "obj-y += xpadneo/" >> ../Makefile
-
-      - name: 编译内核 vmlinux 与 驱动目标文件
-        run: |
-          cd workspace/common
+          # 增量编译驱动的 .o 文件 (极快)
+          cd ../../../
           export PATH="$(pwd)/../clang19/bin:$PATH"
-          
-          export MAKE_ARGS="ARCH=arm64 \
-                     CROSS_COMPILE=aarch64-linux-gnu- \
-                     LLVM=1 \
-                     LLVM_IAS=1 \
-                     CLANG_TRIPLE=aarch64-linux-gnu-"
+          export MAKE_ARGS="ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LLVM=1 LLVM_IAS=1 CLANG_TRIPLE=aarch64-linux-gnu-"
+          make $MAKE_ARGS -j$(nproc) M=drivers/hid/xpadneo modules
 
-          make $MAKE_ARGS gki_defconfig
-          
-          # 禁用 BTF 调试信息防止链接报错
-          scripts/config --disable CONFIG_DEBUG_INFO_BTF
-          scripts/config --disable CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT
-          
-          sed -i "s/CONFIG_LOCALVERSION=.*/CONFIG_LOCALVERSION=\"${{ env.KERNEL_LOCALVERSION }}\"/" .config
-          
-          # 【重要】必须编译出 vmlinux 才能进行 KPM 重定位
-          # 这一步比较耗时，请耐心等待
-          make $MAKE_ARGS -j$(nproc) vmlinux modules
-
-      - name: 构建 KPM 补丁
+      - name: 构建 KPM 补丁 (快速构建区)
         run: |
           cd workspace/common
           
-          # 1. 载入你上传到仓库里的 kptools-linux (假设文件名叫 kptools)
-          # 注意：请确保你已经将该文件上传到了你的仓库根目录
+          # 1. 载入仓库里的 kptools
           if [ -f "../../kptools" ]; then
             cp "../../kptools" ./kptools
             chmod +x ./kptools
           else
-            echo "错误：未在仓库根目录发现 kptools 文件！"
+            echo "错误：请确保仓库根目录有 kptools (即 kptools-linux)"
             exit 1
           fi
           
-          # 2. 创建 KPM 入口 stub
+          # 2. 创建引导 stub
           cat << 'EOF' > kpm_stub.c
           #include <linux/module.h>
           extern int xpadneo_init_kpm(void);
@@ -110,17 +116,20 @@ jobs:
           module_exit(kpm_exit);
           EOF
           
-          # 3. 编译 Stub 目标文件
+          # 3. 编译 Stub (修复头文件路径)
           export CLANG_PATH="$(pwd)/../clang19/bin/clang"
           $CLANG_PATH -target aarch64-linux-gnu \
             -I./include \
+            -I./include/uapi \
             -I./arch/arm64/include \
+            -I./arch/arm64/include/uapi \
             -I./arch/arm64/include/generated \
+            -I./arch/arm64/include/generated/uapi \
             -I./include/generated \
-            -D__KERNEL__ -c kpm_stub.c -o kpm_stub.o
+            -I./include/generated/uapi \
+            -D__KERNEL__ -D__AARCH64__ -O2 -c kpm_stub.c -o kpm_stub.o
 
-          # 4. 合成 .kpm 补丁
-          # 根据 kptools 版本，命令可能是 kpm build 或直接 build
+          # 4. 合成 KPM
           ./kptools kpm build \
             --arch arm64 \
             --vmlinux ./vmlinux \
@@ -128,8 +137,8 @@ jobs:
             --output xpadneo.kpm \
             drivers/hid/xpadneo/*.o kpm_stub.o
 
-      - name: 提取并上传 KPM
+      - name: 上传 KPM 结果
         uses: actions/upload-artifact@v4
         with:
-          name: xpadneo-kpm-package
+          name: xpadneo-apatch-kpm
           path: workspace/common/xpadneo.kpm

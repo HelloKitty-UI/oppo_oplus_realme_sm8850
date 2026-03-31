@@ -1,4 +1,4 @@
-name: 编译 xpadneo (APatch KPM 转换版)
+name: 编译 xpadneo (APatch KPM 终极版)
 
 on:
   workflow_dispatch:
@@ -12,6 +12,9 @@ jobs:
   build_xpadneo_kpm:
     runs-on: ubuntu-latest
     steps:
+      - name: 检出仓库代码
+        uses: actions/checkout@v4
+
       - name: 安装环境依赖
         run: |
           sudo apt update
@@ -27,7 +30,7 @@ jobs:
           aria2c -s16 -x16 -k1M https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang19-r536225/clang-r536225.zip -o clang.zip
           unzip -q clang.zip -d clang19
           
-          # 下载一加内核源码
+          # 下载内核源码 (sm8850/6.12)
           aria2c -s16 -x16 -k1M https://github.com/cctv18/android_kernel_common_oneplus_sm8850/archive/refs/heads/oneplus/sm8850_v_16.0.0_oneplus_15.zip -o common.zip
           unzip -q common.zip
           mv android_kernel_common_oneplus_sm8850-oneplus-sm8850_v_16.0.0_oneplus_15 common
@@ -40,16 +43,15 @@ jobs:
           mkdir -p common/drivers/hid/xpadneo
           cp -r xpadneo/hid-xpadneo/src/xpadneo/* common/drivers/hid/xpadneo/
           
-          # 【关键】解除 static 限制，使 KPM 能找到初始化函数
-          # 将 xpad_init 改为非静态，并重命名以防冲突
+          # 【核心】解除 static 限制，使 KPM 引导头能访问初始化函数
           cd common/drivers/hid/xpadneo
           sed -i 's/static int __init xpad_init/int xpadneo_init_kpm/g' core.c
           sed -i 's/static void __exit xpad_exit/void xpadneo_exit_kpm/g' core.c
           
-          # 禁用电池上报
+          # 禁用电池上报 (避免冲突)
           sed -i 's/defined(CONFIG_XBOX_ONE_BATTERY)/0/g' core.c || true
           
-          # 创建 Makefile
+          # 创建树内 Makefile
           cat << 'EOF' > Makefile
           XPADNEO_VERSION := "0.9.6"
           ccflags-y += -DVERSION=$(XPADNEO_VERSION)
@@ -60,7 +62,7 @@ jobs:
           # 将驱动目录加入内核扫描
           echo "obj-y += xpadneo/" >> ../Makefile
 
-      - name: 编译 vmlinux 与 模块
+      - name: 编译内核 vmlinux 与 驱动目标文件
         run: |
           cd workspace/common
           export PATH="$(pwd)/../clang19/bin:$PATH"
@@ -73,25 +75,31 @@ jobs:
 
           make $MAKE_ARGS gki_defconfig
           
-          # 禁用 BTF 以加快编译并减少错误
+          # 禁用 BTF 调试信息防止链接报错
           scripts/config --disable CONFIG_DEBUG_INFO_BTF
           scripts/config --disable CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT
           
           sed -i "s/CONFIG_LOCALVERSION=.*/CONFIG_LOCALVERSION=\"${{ env.KERNEL_LOCALVERSION }}\"/" .config
           
-          # 【关键】不仅编译 modules，还要编译出 vmlinux
-          # 这步可能耗时较长 (15-30分钟)
+          # 【重要】必须编译出 vmlinux 才能进行 KPM 重定位
+          # 这一步比较耗时，请耐心等待
           make $MAKE_ARGS -j$(nproc) vmlinux modules
 
-      - name: 构建 KPM 模块
+      - name: 构建 KPM 补丁
         run: |
           cd workspace/common
           
-          # 1. 下载 APatch kpatch 工具
-          curl -L https://github.com/bmax121/APatch/releases/latest/download/kpatch -o kpatch
-          chmod +x kpatch
+          # 1. 载入你上传到仓库里的 kptools-linux (假设文件名叫 kptools)
+          # 注意：请确保你已经将该文件上传到了你的仓库根目录
+          if [ -f "../../kptools" ]; then
+            cp "../../kptools" ./kptools
+            chmod +x ./kptools
+          else
+            echo "错误：未在仓库根目录发现 kptools 文件！"
+            exit 1
+          fi
           
-          # 2. 创建 KPM 入口引导文件
+          # 2. 创建 KPM 入口 stub
           cat << 'EOF' > kpm_stub.c
           #include <linux/module.h>
           extern int xpadneo_init_kpm(void);
@@ -102,21 +110,26 @@ jobs:
           module_exit(kpm_exit);
           EOF
           
-          # 3. 编译引导文件为 .o
-          export PATH="$(pwd)/../clang19/bin:$PATH"
-          $PATH/clang -target aarch64-linux-gnu -I./include -I./arch/arm64/include -D__KERNEL__ -c kpm_stub.c -o kpm_stub.o
+          # 3. 编译 Stub 目标文件
+          export CLANG_PATH="$(pwd)/../clang19/bin/clang"
+          $CLANG_PATH -target aarch64-linux-gnu \
+            -I./include \
+            -I./arch/arm64/include \
+            -I./arch/arm64/include/generated \
+            -I./include/generated \
+            -D__KERNEL__ -c kpm_stub.c -o kpm_stub.o
 
-          # 4. 使用 kpatch 工具合成 .kpm
-          # 它会读取 vmlinux 里的地址，将所有 .o 缝合成一个补丁
-          ./kpatch build \
+          # 4. 合成 .kpm 补丁
+          # 根据 kptools 版本，命令可能是 kpm build 或直接 build
+          ./kptools kpm build \
             --arch arm64 \
             --vmlinux ./vmlinux \
             --config .config \
             --output xpadneo.kpm \
             drivers/hid/xpadneo/*.o kpm_stub.o
 
-      - name: 上传 KPM 文件
+      - name: 提取并上传 KPM
         uses: actions/upload-artifact@v4
         with:
-          name: xpadneo-apatch-kpm
+          name: xpadneo-kpm-package
           path: workspace/common/xpadneo.kpm

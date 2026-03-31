@@ -1,4 +1,4 @@
-name: 编译 xpadneo (第二步：利用缓存调试 KPM - 绕过校验版)
+name: 编译 xpadneo (第二步：利用缓存调试 KPM - 最终路径版)
 
 on:
   workflow_dispatch:
@@ -70,8 +70,9 @@ jobs:
           cp -r xpadneo/hid-xpadneo/src/xpadneo/* $XPAD_DIR/
           
           cd $XPAD_DIR
-          sed -i 's/static int __init xpad_init/int xpadneo_init_kpm(void)/g' core.c
-          sed -i 's/static void __exit xpad_exit/void xpadneo_exit_kpm(void)/g' core.c
+          # 修改函数签名，确保 KPM 能调用
+          sed -i 's/static int __init xpad_init/int xpadneo_init_kpm/g' core.c
+          sed -i 's/static void __exit xpad_exit/void xpadneo_exit_kpm/g' core.c
           sed -i 's/defined(CONFIG_XBOX_ONE_BATTERY)/0/g' core.c || true
           
           cat << 'EOF' > Makefile
@@ -81,13 +82,12 @@ jobs:
           hid-xpadneo-y := consumer.o core.o debug.o device.o events.o keyboard.o mappings.o mouse.o power.o quirks.o rumble.o synthetic.o
           EOF
 
-          # 【关键修改】只编译到 .o 文件，不运行 modpost 校验
           cd $KERNEL_DIR
           export PATH="$CLANG_BIN:$PATH"
           export MAKE_ARGS="ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LLVM=1 LLVM_IAS=1 CLANG_TRIPLE=aarch64-linux-gnu-"
           
-          # 我们只需要 drivers/hid/xpadneo/ 目录下的所有 .o 文件
-          make $MAKE_ARGS -j$(nproc) M=drivers/hid/xpadneo modules || echo "忽略 modpost 错误"
+          # 编译驱动 .o 文件，忽略最后的链接错误
+          make $MAKE_ARGS -j$(nproc) M=drivers/hid/xpadneo modules || true
 
       - name: 构建 KPM 补丁
         run: |
@@ -103,28 +103,26 @@ jobs:
             exit 1
           fi
           
+          # 1. 编写“零依赖”Stub 文件
+          # 绕过所有内核头文件，直接声明 KPM 接口
           cat << 'EOF' > kpm_stub.c
-          #include <linux/module.h>
+          typedef int (*init_ptr)(void);
+          typedef void (*exit_ptr)(void);
+
           extern int xpadneo_init_kpm(void);
           extern void xpadneo_exit_kpm(void);
-          int kpm_init(void) { return xpadneo_init_kpm(); }
-          void kpm_exit(void) { xpadneo_exit_kpm(); }
-          module_init(kpm_init);
-          module_exit(kpm_exit);
+
+          // KPM 期望的导出符号名
+          init_ptr _kpm_init = xpadneo_init_kpm;
+          exit_ptr _kpm_exit = xpadneo_exit_kpm;
           EOF
           
-          # 编译 Stub
+          # 2. 极简编译 Stub (无需任何 -I 路径)
           export CLANG_PATH="$ROOT_DIR/workspace/clang19/bin/clang"
-          $CLANG_PATH -target aarch64-linux-gnu \
-            -I./include \
-            -I./include/uapi \
-            -I./arch/arm64/include \
-            -I./arch/arm64/include/uapi \
-            -I./arch/arm64/include/generated \
-            -I./include/generated \
-            -D__KERNEL__ -D__AARCH64__ -O2 -c kpm_stub.c -o kpm_stub.o
+          $CLANG_PATH -target aarch64-linux-gnu -O2 -c kpm_stub.c -o kpm_stub.o
 
-          # 合成 KPM
+          # 3. 合成 KPM
+          # 将所有生成的 .o 文件合成最终补丁
           ./kptools kpm build \
             --arch arm64 \
             --vmlinux ./vmlinux \

@@ -1,4 +1,4 @@
-name: 编译 xpadneo (第二步：利用缓存调试 KPM - 路径修复版)
+name: 编译 xpadneo (第二步：利用缓存调试 KPM - 绕过校验版)
 
 on:
   workflow_dispatch:
@@ -56,9 +56,8 @@ jobs:
           sed -i "s/CONFIG_LOCALVERSION=.*/CONFIG_LOCALVERSION=\"${{ env.KERNEL_LOCALVERSION }}\"/" .config
           make $MAKE_ARGS -j$(nproc) vmlinux
 
-      - name: 准备驱动源码并增量编译
+      - name: 准备驱动源码并编译目标文件
         run: |
-          # 定义绝对路径变量
           ROOT_DIR=$(pwd)
           KERNEL_DIR=$ROOT_DIR/workspace/common
           CLANG_BIN=$ROOT_DIR/workspace/clang19/bin
@@ -66,15 +65,13 @@ jobs:
           cd workspace
           [ -d "xpadneo" ] || git clone https://github.com/atar-axis/xpadneo.git
           
-          # 准备驱动目录
           XPAD_DIR=$KERNEL_DIR/drivers/hid/xpadneo
           mkdir -p $XPAD_DIR
           cp -r xpadneo/hid-xpadneo/src/xpadneo/* $XPAD_DIR/
           
-          # 解除 static 限制
           cd $XPAD_DIR
-          sed -i 's/static int __init xpad_init/int xpadneo_init_kpm/g' core.c
-          sed -i 's/static void __exit xpad_exit/void xpadneo_exit_kpm/g' core.c
+          sed -i 's/static int __init xpad_init/int xpadneo_init_kpm(void)/g' core.c
+          sed -i 's/static void __exit xpad_exit/void xpadneo_exit_kpm(void)/g' core.c
           sed -i 's/defined(CONFIG_XBOX_ONE_BATTERY)/0/g' core.c || true
           
           cat << 'EOF' > Makefile
@@ -84,12 +81,13 @@ jobs:
           hid-xpadneo-y := consumer.o core.o debug.o device.o events.o keyboard.o mappings.o mouse.o power.o quirks.o rumble.o synthetic.o
           EOF
 
-          # 执行增量编译
+          # 【关键修改】只编译到 .o 文件，不运行 modpost 校验
           cd $KERNEL_DIR
           export PATH="$CLANG_BIN:$PATH"
           export MAKE_ARGS="ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LLVM=1 LLVM_IAS=1 CLANG_TRIPLE=aarch64-linux-gnu-"
           
-          make $MAKE_ARGS -j$(nproc) M=drivers/hid/xpadneo modules
+          # 我们只需要 drivers/hid/xpadneo/ 目录下的所有 .o 文件
+          make $MAKE_ARGS -j$(nproc) M=drivers/hid/xpadneo modules || echo "忽略 modpost 错误"
 
       - name: 构建 KPM 补丁
         run: |
@@ -97,16 +95,14 @@ jobs:
           KERNEL_DIR=$ROOT_DIR/workspace/common
           cd $KERNEL_DIR
           
-          # 1. 载入 kptools
           if [ -f "$ROOT_DIR/kptools" ]; then
             cp "$ROOT_DIR/kptools" ./kptools
             chmod +x ./kptools
           else
-            echo "错误：未发现 kptools 文件！请确保它在仓库根目录。"
+            echo "错误：未发现 kptools 文件！"
             exit 1
           fi
           
-          # 2. 编写引导 Stub
           cat << 'EOF' > kpm_stub.c
           #include <linux/module.h>
           extern int xpadneo_init_kpm(void);
@@ -117,7 +113,7 @@ jobs:
           module_exit(kpm_exit);
           EOF
           
-          # 3. 编译 Stub 目标文件
+          # 编译 Stub
           export CLANG_PATH="$ROOT_DIR/workspace/clang19/bin/clang"
           $CLANG_PATH -target aarch64-linux-gnu \
             -I./include \
@@ -128,7 +124,7 @@ jobs:
             -I./include/generated \
             -D__KERNEL__ -D__AARCH64__ -O2 -c kpm_stub.c -o kpm_stub.o
 
-          # 4. 合成 KPM
+          # 合成 KPM
           ./kptools kpm build \
             --arch arm64 \
             --vmlinux ./vmlinux \

@@ -465,22 +465,37 @@ jobs:
           patch -p1 -F 3 < config.patch || true
       - name: 注入修改后的 Xbox 驱动源码
         run: |
-          # 打印当前目录内容，方便在日志中调试确认文件位置
-          ls -R $GITHUB_WORKSPACE
+          echo ">>> 正在定位项目根目录..."
+          # 确保进入工作区根目录
+          cd ${{ github.workspace }}
           
-          # 定义目标路径
-          TARGET_DIR="${{ github.workspace }}/kernel_workspace/common/drivers/hid"
-          
-          # 使用绝对路径进行覆盖
-          if [ -f "${{ github.workspace }}/hid-microsoft.c" ]; then
-            cp -v "${{ github.workspace }}/hid-microsoft.c" "$TARGET_DIR/hid-microsoft.c"
+          # 检查当前目录下是否存在修改后的源码
+          if [ -f "hid-microsoft.c" ]; then
+            echo ">>> 发现修改后的 hid-microsoft.c，准备注入..."
+            # 定义内核源码中的目标位置
+            TARGET_FILE="${{ github.workspace }}/kernel_workspace/common/drivers/hid/hid-microsoft.c"
+            
+            # 强制覆盖
+            cp -vf "hid-microsoft.c" "$TARGET_FILE"
+            echo ">>> 源码覆盖成功: $TARGET_FILE"
           else
-            echo "错误：在仓库根目录未找到 hid-microsoft.c！"
+            echo ">>> [错误] 在仓库根目录未找到 hid-microsoft.c！"
+            echo ">>> 当前目录内容如下："
+            ls -F
             exit 1
           fi
           
-          # 配置为模块编译
-          echo "CONFIG_HID_MICROSOFT=m" >> ${{ github.workspace }}/kernel_workspace/common/arch/arm64/configs/gki_defconfig
+          # 配置为模块编译 (m)
+          # 注意：必须同时修改 gki_defconfig，确保内核将其编译为 .ko 而非内置
+          DEFCONFIG="${{ github.workspace }}/kernel_workspace/common/arch/arm64/configs/gki_defconfig"
+          if [ -f "$DEFCONFIG" ]; then
+            # 先删除可能存在的内置配置，再追加模块配置
+            sed -i '/CONFIG_HID_MICROSOFT/d' "$DEFCONFIG"
+            echo "CONFIG_HID_MICROSOFT=m" >> "$DEFCONFIG"
+            echo ">>> 已在 gki_defconfig 中强制启用模块化编译 (CONFIG_HID_MICROSOFT=m)"
+          else
+            echo ">>> [警告] 未找到 gki_defconfig，请检查内核路径！"
+          fi
       - name: 添加 BBR 等一系列拥塞控制算法
         run: |
           if [[ "${{ github.event.inputs.bbr_enable }}" != "false" ]]; then
@@ -895,7 +910,6 @@ jobs:
       - name: 提取并上传 hid-microsoft.ko
         uses: actions/upload-artifact@v4
         with:
-          name: xbox-vibration-module
-          # 注意：path 必须指向编译输出的实际位置
+          name: Xbox-Vibration-Module-6.12.23
           path: kernel_workspace/common/out/drivers/hid/hid-microsoft.ko
-          if-no-files-found: error # 如果没搜到文件就报错，方便发现编译是否成功
+          if-no-files-found: error

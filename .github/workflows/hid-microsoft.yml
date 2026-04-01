@@ -431,7 +431,7 @@ jobs:
           echo "CONFIG_RUST=y" >> ./common/arch/arm64/configs/gki_defconfig
           echo "CONFIG_ANDROID_BINDER_IPC_RUST=m" >> ./common/arch/arm64/configs/gki_defconfig
           - name: 注入修改后的 Xbox 驱动源码
-        run: |
+          run: |
           # 进入源码目录
           cd kernel_workspace/common
           

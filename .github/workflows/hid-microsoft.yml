@@ -465,19 +465,22 @@ jobs:
           patch -p1 -F 3 < config.patch || true
       - name: 注入修改后的 Xbox 驱动源码
         run: |
-          # 进入源码目录
-          cd kernel_workspace/common
+          # 打印当前目录内容，方便在日志中调试确认文件位置
+          ls -R $GITHUB_WORKSPACE
           
-          # 1. 用你仓库根目录下的新文件覆盖内核源码里的旧文件
-          # 注意：$GITHUB_WORKSPACE 指向你当前仓库的根目录
-          cp $GITHUB_WORKSPACE/hid-microsoft.c ./drivers/hid/hid-microsoft.c
+          # 定义目标路径
+          TARGET_DIR="${{ github.workspace }}/kernel_workspace/common/drivers/hid"
           
-          # 2. 强制将该驱动配置为模块 (m)
-          # 这样编译完后才会产生 .ko 文件
-          echo "CONFIG_HID_MICROSOFT=m" >> ./arch/arm64/configs/gki_defconfig
+          # 使用绝对路径进行覆盖
+          if [ -f "${{ github.workspace }}/hid-microsoft.c" ]; then
+            cp -v "${{ github.workspace }}/hid-microsoft.c" "$TARGET_DIR/hid-microsoft.c"
+          else
+            echo "错误：在仓库根目录未找到 hid-microsoft.c！"
+            exit 1
+          fi
           
-          echo "Xbox 源码注入完成，已配置为模块编译。"
-
+          # 配置为模块编译
+          echo "CONFIG_HID_MICROSOFT=m" >> ${{ github.workspace }}/kernel_workspace/common/arch/arm64/configs/gki_defconfig
       - name: 添加 BBR 等一系列拥塞控制算法
         run: |
           if [[ "${{ github.event.inputs.bbr_enable }}" != "false" ]]; then
@@ -848,12 +851,7 @@ jobs:
             KSU_TYPENAME="无内置KSU"
           fi
           echo "KSU_TYPENAME=$KSU_TYPENAME" >> $GITHUB_ENV
-      - name: 提取并上传 hid-microsoft.ko
-        uses: actions/upload-artifact@v4
-        with:
-          name: xbox-vibration-module
-          path: kernel_workspace/common/out/drivers/hid/hid-microsoft.ko
-          
+    
       - name: 创建发布
         id: create_release
         uses: softprops/action-gh-release@v2.5.0
@@ -894,3 +892,10 @@ jobs:
           prerelease: false
           files: |
             release_zips/AnyKernel3_*.zip
+      - name: 提取并上传 hid-microsoft.ko
+        uses: actions/upload-artifact@v4
+        with:
+          name: xbox-vibration-module
+          # 注意：path 必须指向编译输出的实际位置
+          path: kernel_workspace/common/out/drivers/hid/hid-microsoft.ko
+          if-no-files-found: error # 如果没搜到文件就报错，方便发现编译是否成功

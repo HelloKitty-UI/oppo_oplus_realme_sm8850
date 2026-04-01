@@ -430,20 +430,6 @@ jobs:
           # 6.12内核Rust配置
           echo "CONFIG_RUST=y" >> ./common/arch/arm64/configs/gki_defconfig
           echo "CONFIG_ANDROID_BINDER_IPC_RUST=m" >> ./common/arch/arm64/configs/gki_defconfig
-          - name: 注入修改后的 Xbox 驱动源码
-          run: |
-          # 进入源码目录
-          cd kernel_workspace/common
-          
-          # 1. 用你仓库根目录下的新文件覆盖内核源码里的旧文件
-          # 注意：$GITHUB_WORKSPACE 指向你当前仓库的根目录
-          cp $GITHUB_WORKSPACE/hid-microsoft.c ./drivers/hid/hid-microsoft.c
-          
-          # 2. 强制将该驱动配置为模块 (m)
-          # 这样编译完后才会产生 .ko 文件
-          echo "CONFIG_HID_MICROSOFT=m" >> ./arch/arm64/configs/gki_defconfig
-          
-          echo "Xbox 源码注入完成，已配置为模块编译。"
       - name: 启用网络功能增强优化配置
         if: inputs.better_net
         run: |
@@ -477,6 +463,20 @@ jobs:
           cd common
           wget https://github.com/$GITHUB_REPOSITORY/raw/refs/heads/$GITHUB_REF_NAME/other_patch/config.patch
           patch -p1 -F 3 < config.patch || true
+      - name: 注入修改后的 Xbox 驱动源码
+        run: |
+          # 进入源码目录
+          cd kernel_workspace/common
+          
+          # 1. 用你仓库根目录下的新文件覆盖内核源码里的旧文件
+          # 注意：$GITHUB_WORKSPACE 指向你当前仓库的根目录
+          cp $GITHUB_WORKSPACE/hid-microsoft.c ./drivers/hid/hid-microsoft.c
+          
+          # 2. 强制将该驱动配置为模块 (m)
+          # 这样编译完后才会产生 .ko 文件
+          echo "CONFIG_HID_MICROSOFT=m" >> ./arch/arm64/configs/gki_defconfig
+          
+          echo "Xbox 源码注入完成，已配置为模块编译。"
 
       - name: 添加 BBR 等一系列拥塞控制算法
         run: |

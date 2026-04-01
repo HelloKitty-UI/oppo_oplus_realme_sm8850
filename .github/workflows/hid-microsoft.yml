@@ -848,7 +848,7 @@ jobs:
             KSU_TYPENAME="无内置KSU"
           fi
           echo "KSU_TYPENAME=$KSU_TYPENAME" >> $GITHUB_ENV
-         - name: 提取并上传 hid-microsoft.ko
+      - name: 提取并上传 hid-microsoft.ko
         uses: actions/upload-artifact@v4
         with:
           name: xbox-vibration-module

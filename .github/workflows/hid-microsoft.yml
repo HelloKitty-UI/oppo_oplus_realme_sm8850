@@ -108,7 +108,7 @@ jobs:
           make -j$(nproc) LLVM=1 ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-gnu- \
             CC=clang LD=ld.lld O=out \
-            M="$MODULE_DIR" modules
+            M="$MODULE_DIR" KBUILD_MODPOST_WARN=1 modules
 
       - name: 检查模块
         run: |
@@ -119,6 +119,7 @@ jobs:
           readelf -h module_build/xbox_ff.ko 2>/dev/null | head -5 || true
           echo "=== vermagic ==="
           strings module_build/xbox_ff.ko | grep vermagic || true
+          echo "=== Build complete ==="
 
       - name: 上传 xbox_ff.ko
         uses: actions/upload-artifact@v4

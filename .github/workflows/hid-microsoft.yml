@@ -11,6 +11,11 @@ on:
         options:
           - '6.12.23'
           - '6.12.38'
+      localversion:
+        description: 'LOCALVERSION 后缀（uname -r 中去掉 6.12.23 剩下的部分，例如 -android16-5-gb2a876903b49-ab14541642-4k）'
+        required: true
+        type: string
+        default: '-4k'
 
 jobs:
   build:
@@ -83,17 +88,26 @@ jobs:
           export RUSTC="rustc"
           export BINDGEN="bindgen"
 
-          # Generate config and build
+          # Generate config
           make -j$(nproc) LLVM=1 ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-gnu- \
             CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm \
             OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump \
             O=out gki_defconfig
 
-          # Enable module build
+          # Enable modules, disable signature verification
           scripts/config --file out/.config --enable MODULES
           scripts/config --file out/.config --enable MODVERSIONS
           scripts/config --file out/.config --disable MODULE_SIG
+          scripts/config --file out/.config --disable MODULE_SIG_ALL
+          # Strip auto LOCALVERSION to produce clean vermagic
+          scripts/config --file out/.config --disable LOCALVERSION_AUTO
+          scripts/config --file out/.config --set-str LOCALVERSION "${{ inputs.localversion }}"
+
+          # Remove dirty suffix and auto version from setlocalversion
+          sed -i 's/ -dirty//g' scripts/setlocalversion
+          sed -i '$i res=$(echo "$res" | sed '\''s/-dirty//g'\'')' scripts/setlocalversion
+
           make -j$(nproc) LLVM=1 ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-gnu- \
             CC=clang LD=ld.lld O=out olddefconfig
@@ -108,7 +122,7 @@ jobs:
             CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm \
             OBJCOPY=llvm-objcopy O=out vmlinux
 
-          # Now build modules (our xbox_ff.o is included)
+          # Build modules (our xbox_ff.o is included)
           make -j$(nproc) LLVM=1 ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-gnu- \
             CC=clang LD=ld.lld O=out modules

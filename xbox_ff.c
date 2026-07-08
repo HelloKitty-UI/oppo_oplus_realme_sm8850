@@ -15,7 +15,6 @@
 #include <linux/list.h>
 #include <linux/module.h>
 #include <linux/slab.h>
-#include <linux/version.h>
 
 MODULE_AUTHOR("xbox-ff");
 MODULE_DESCRIPTION("Xbox Bluetooth Controller Force Feedback for GKI 6.12");
@@ -138,27 +137,6 @@ static struct hid_driver xbox_ff_driver = {
 	.remove  = xbox_ff_remove,
 };
 
-/*
- * On module load, walk all existing HID devices and rebind matching ones
- * from the built-in hid-microsoft to our driver.
- */
-static int xbox_ff_rebind_existing(void)
-{
-	struct hid_device *hdev;
-	int count = 0;
-
-	hid_for_each_dev(hdev) {
-		if (hid_match_device(hdev, &xbox_ff_driver)) {
-			hid_info(hdev, "xbox_ff: rebinding %s from built-in driver\n",
-				 dev_name(&hdev->dev));
-			device_release_driver(&hdev->dev);
-			device_attach(&hdev->dev);
-			count++;
-		}
-	}
-	return count;
-}
-
 static int __init xbox_ff_init(void)
 {
 	int ret;
@@ -169,7 +147,6 @@ static int __init xbox_ff_init(void)
 		return ret;
 	}
 
-	xbox_ff_rebind_existing();
 	pr_info("xbox_ff: driver loaded\n");
 	return 0;
 }

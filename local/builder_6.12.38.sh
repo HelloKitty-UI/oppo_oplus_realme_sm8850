@@ -13,7 +13,7 @@ read -p "请输入自定义内核后缀（默认：android16-5-g8c67d4274c0a-ab1
 CUSTOM_SUFFIX=${CUSTOM_SUFFIX:-android16-5-g8c67d4274c0a-ab14275539-4k}
 read -p "是否启用susfs？(y/n，默认：y): " APPLY_SUSFS
 APPLY_SUSFS=${APPLY_SUSFS:-y}
-read -p "是否启用 KPM？(b-(re)sukisu内置kpm, k-kernelpatch next独立kpm实现, n-关闭kpm，默认：n): " USE_PATCH_LINUX
+read -p "是否启用 KPM？(y-启用 KpatchNext独立kpm实现, n-关闭kpm，默认：n): " USE_PATCH_LINUX
 USE_PATCH_LINUX=${USE_PATCH_LINUX:-n}
 read -p "KSU分支版本(r=ReSukiSU, y=SukiSU Ultra, n=KernelSU Next, k=KSU, l=lkm模式(无内置KSU), 默认：r): " KSU_BRANCH
 KSU_BRANCH=${KSU_BRANCH:-r}
@@ -25,6 +25,8 @@ read -p "是否启用网络功能增强优化配置？(y/n，默认：y): " APPL
 APPLY_BETTERNET=${APPLY_BETTERNET:-y}
 read -p "是否添加 BBR 等一系列拥塞控制算法？(y添加/n禁用/d默认，默认：n): " APPLY_BBR
 APPLY_BBR=${APPLY_BBR:-n}
+read -p "是否添加 Droidspaces 容器支持？(n禁用/s标准/e扩展，默认：n): " APPLY_DROIDSPACES
+APPLY_DROIDSPACES=${APPLY_DROIDSPACES:-n}
 read -p "是否启用ADIOS调度器？(y/n，默认：y): " APPLY_ADIOS
 APPLY_ADIOS=${APPLY_ADIOS:-y}
 read -p "是否启用Re-Kernel？(y/n，默认：n): " APPLY_REKERNEL
@@ -44,25 +46,18 @@ else
   KSU_TYPE="no KSU"
 fi
 
-if [[ "$USE_PATCH_LINUX" == "b" || "$USE_PATCH_LINUX" == "B" ]]; then
-  KPM_TYPE="builtin"
-elif [[ "$USE_PATCH_LINUX" == "k" || "$USE_PATCH_LINUX" == "K" ]]; then
-  KPM_TYPE="KernelPatch Next"
-else
-  KPM_TYPE="no kpm"
-fi
-
 echo
 echo "===== 配置信息 ====="
 echo "适用机型: $MANIFEST"
 echo "自定义内核后缀: -$CUSTOM_SUFFIX"
 echo "KSU分支版本: $KSU_TYPE"
 echo "启用susfs: $APPLY_SUSFS"
-echo "启用 KPM: $KPM_TYPE"
+echo "启用 KPM: $USE_PATCH_LINUX"
 echo "应用 lz4&zstd 补丁: $APPLY_LZ4"
 echo "应用 lz4kd 补丁: $APPLY_LZ4KD"
 echo "应用网络功能增强优化配置: $APPLY_BETTERNET"
 echo "应用 BBR 等算法: $APPLY_BBR"
+echo "应用 Droidspaces 容器支持: $APPLY_DROIDSPACES"
 echo "启用ADIOS调度器: $APPLY_ADIOS"
 echo "启用Re-Kernel: $APPLY_REKERNEL"
 echo "启用内核级基带保护: $APPLY_BBG"
@@ -137,54 +132,8 @@ sed -i 's/${scm_version}//' ./common/scripts/setlocalversion
 echo "CONFIG_LOCALVERSION_AUTO=n" >> ./common/arch/arm64/configs/gki_defconfig
 
 # ===== 拉取 KSU 并设置版本号 =====
-if [[ "$KSU_BRANCH" == "y" || "$KSU_BRANCH" == "Y" ]]; then
-  echo ">>> 拉取 SukiSU-Ultra 并设置版本..."
-  curl -LSs "https://raw.githubusercontent.com/ShirkNeko/SukiSU-Ultra/main/kernel/setup.sh" | bash -s builtin
-  cd KernelSU
-  GIT_COMMIT_HASH=$(git rev-parse --short=8 HEAD)
-  echo "当前提交哈希: $GIT_COMMIT_HASH"
-  echo ">>> 正在获取上游 API 版本信息..."
-  for i in {1..3}; do
-      KSU_API_VERSION=$(curl -s "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/builtin/kernel/Kbuild" | \
-          grep -m1 "KSU_VERSION_API :=" | \
-          awk -F'= ' '{print $2}' | \
-          tr -d '[:space:]')
-      if [ -n "$KSU_API_VERSION" ]; then
-          echo "成功获取 API 版本: $KSU_API_VERSION"
-          break
-      else
-          echo "获取失败，重试中 ($i/3)..."
-          sleep 1
-      fi
-  done
-  if [ -z "$KSU_API_VERSION" ]; then
-      echo -e "无法获取 API 版本，使用默认值 3.1.7..."
-      KSU_API_VERSION="3.1.7"
-  fi
-  export KSU_API_VERSION=$KSU_API_VERSION
-
-  VERSION_DEFINITIONS=$'define get_ksu_version_full\nv\\$1-'"$GIT_COMMIT_HASH"$'@cctv18\nendef\n\nKSU_VERSION_API := '"$KSU_API_VERSION"$'\nKSU_VERSION_FULL := v'"$KSU_API_VERSION"$'-'"$GIT_COMMIT_HASH"$'@cctv18'
-
-  echo ">>> 正在修改 kernel/Kbuild 文件..."
-  sed -i '/define get_ksu_version_full/,/endef/d' kernel/Kbuild
-  sed -i '/KSU_VERSION_API :=/d' kernel/Kbuild
-  sed -i '/KSU_VERSION_FULL :=/d' kernel/Kbuild
-  awk -v def="$VERSION_DEFINITIONS" '
-      /REPO_OWNER :=/ {print; print def; inserted=1; next}
-      1
-      END {if (!inserted) print def}
-  ' kernel/Kbuild > kernel/Kbuild.tmp && mv kernel/Kbuild.tmp kernel/Kbuild
-
-  KSU_VERSION_CODE=$(expr $(git rev-list --count main 2>/dev/null) + 37185 2>/dev/null || echo 114514)
-  echo ">>> 修改完成！验证结果："
-  echo "------------------------------------------------"
-  grep -A10 "REPO_OWNER" kernel/Kbuild | head -n 10
-  echo "------------------------------------------------"
-  grep "KSU_VERSION_FULL" kernel/Kbuild
-  echo ">>> 最终版本字符串: v${KSU_API_VERSION}-${GIT_COMMIT_HASH}@cctv18"
-  echo ">>> Version Code: ${KSU_VERSION_CODE}"
-elif [[ "$KSU_BRANCH" == "r" || "$KSU_BRANCH" == "R" ]]; then
-  echo ">>> 拉取 ReSukiSU 并设置版本..."
+if [[ $KSU_BRANCH == [yYrR] ]]; then
+  echo ">>> 拉取 ReSukiSU 并设置版本（由于SukiSU长期未维护无法正常编译，且ReSukiSU兼容sukisu管理器，故SukiSU源码仓库已重定向为resukisu）..."
   curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash -s main
   echo 'CONFIG_KSU_FULL_NAME_FORMAT="%TAG_NAME%-%COMMIT_SHA%@cctv18"' >> ./common/arch/arm64/configs/gki_defconfig
 elif [[ "$KSU_BRANCH" == "n" || "$KSU_BRANCH" == "N" ]]; then
@@ -297,11 +246,6 @@ echo "CONFIG_HEADERS_INSTALL=n" >> "$DEFCONFIG_FILE"
 echo "CONFIG_RUST=y" >> ./common/arch/arm64/configs/gki_defconfig
 echo "CONFIG_ANDROID_BINDER_IPC_RUST=m" >> ./common/arch/arm64/configs/gki_defconfig
 
-# 仅在启用了 KPM 时添加 KPM 支持
-if [[ "$USE_PATCH_LINUX" == [bB] && $KSU_BRANCH == [yYrR] ]]; then
-  echo "CONFIG_KPM=y" >> "$DEFCONFIG_FILE"
-fi
-
 # 仅在启用了 LZ4KD 补丁时添加相关算法支持
 if [[ "$APPLY_LZ4KD" == "y" || "$APPLY_LZ4KD" == "Y" ]]; then
   cat >> "$DEFCONFIG_FILE" <<EOF
@@ -365,6 +309,47 @@ if [[ "$APPLY_BBR" == "y" || "$APPLY_BBR" == "Y" || "$APPLY_BBR" == "d" || "$APP
     echo "CONFIG_DEFAULT_TCP_CONG=bbr" >> "$DEFCONFIG_FILE"
   else
     echo "CONFIG_DEFAULT_TCP_CONG=cubic" >> "$DEFCONFIG_FILE"
+  fi
+fi
+
+# ===== 启用 Droidspaces 容器支持 =====
+if [[ "$APPLY_DROIDSPACES" == [sSeE] ]]; then
+  echo ">>> 正在添加 Droidspaces 容器支持..."
+  # 开启 Droidspaces 容器所需内核支持
+  echo "CONFIG_PID_NS=y" >> "$DEFCONFIG_FILE"
+  echo "CONFIG_IPC_NS=y" >> "$DEFCONFIG_FILE"
+  echo "CONFIG_SYSVIPC=y" >> "$DEFCONFIG_FILE"
+  echo "CONFIG_DEVTMPFS=y" >> "$DEFCONFIG_FILE"
+  echo "CONFIG_NAMESPACES=y" >> "$DEFCONFIG_FILE"
+  echo "CONFIG_POSIX_MQUEUE=y" >> "$DEFCONFIG_FILE"
+  echo "CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y" >> "$DEFCONFIG_FILE"
+  echo "CONFIG_NETFILTER_XT_TARGET_LOG=y" >> "$DEFCONFIG_FILE"
+  echo "CONFIG_NETFILTER_XT_MATCH_RECENT=y" >> "$DEFCONFIG_FILE"
+  # 开启 NTSync
+  echo "CONFIG_NTSYNC=y" >> "$DEFCONFIG_FILE"
+  cd common
+  # 应用 Droidspaces 容器必须补丁
+  wget https://github.com/cctv18/oppo_oplus_realme_sm8850/raw/refs/heads/main/droidspaces_patch/fix_sysvipc_kabi_a16-6.12.patch
+  patch -p1 -F 3 < fix_sysvipc_kabi_a16-6.12.patch || true
+  # 修补 oplus_bsp_midas 行为，避免开机崩溃
+  wget https://github.com/cctv18/oppo_oplus_realme_sm8850/raw/refs/heads/main/droidspaces_patch/fix_oplus_bsp_midas.patch
+  patch -p1 -F 3 < fix_oplus_bsp_midas.patch || true
+  # 应用 NTSync 补丁
+  wget https://github.com/cctv18/oppo_oplus_realme_sm8850/raw/refs/heads/main/droidspaces_patch/ntsync_compat_android16-6.12.patch
+  patch -p1 -F 3 < ntsync_compat_android16-6.12.patch || true
+  cd ..
+  if [[ "$APPLY_DROIDSPACES" == [eE] ]]; then
+    echo "正在启用容器环境扩展支持..."
+    # 开启虚拟 HCI 设备支持
+    echo "CONFIG_BT_HCIVHCI=y" >> "$DEFCONFIG_FILE"
+    # 开启 systemd-coredump 支持
+    echo "CONFIG_STATIC_USERMODEHELPER=n" >> "$DEFCONFIG_FILE"
+    # 添加 Lindroid EVDI DRM 驱动
+    echo "CONFIG_DRM_LINDROID_EVDI=y" >> "$DEFCONFIG_FILE"
+    cd common
+    wget https://github.com/cctv18/oppo_oplus_realme_sm8850/raw/refs/heads/main/droidspaces_patch/evdi_drm.patch
+    patch -p1 -F 3 < evdi_drm.patch || true
+    cd ..
   fi
 fi
 
@@ -459,16 +444,7 @@ echo ">>> 内核编译成功！"
 # ===== 选择使用 patch_linux (KPM补丁)=====
 WORKDIR="$SCRIPT_DIR"
 OUT_DIR="$WORKDIR/kernel_workspace/common/out/arch/arm64/boot"
-if [[ "$USE_PATCH_LINUX" == [bB] && $KSU_BRANCH == [yYrR] ]]; then
-  echo ">>> 使用 patch_linux 工具处理输出..."
-  cd "$OUT_DIR"
-  wget https://github.com/SukiSU-Ultra/SukiSU_KernelPatch_patch/releases/latest/download/patch_linux
-  chmod +x patch_linux
-  ./patch_linux
-  rm -f Image
-  mv oImage Image
-  echo ">>> 已成功打上KPM补丁!"
-elif [[ "$USE_PATCH_LINUX" == [kK] ]]; then
+if [[ "$USE_PATCH_LINUX" == [yY] ]]; then
   echo ">>> 使用 kptools-linux 工具处理输出..."
   cd "$OUT_DIR"
   wget https://github.com/KernelSU-Next/KPatch-Next/releases/latest/download/kptools-linux
@@ -478,8 +454,6 @@ elif [[ "$USE_PATCH_LINUX" == [kK] ]]; then
   rm -f Image
   mv oImage Image
   echo ">>> 已成功打上KP-N补丁!"
-else
-  echo ">>> 跳过 KPM 修补操作..."
 fi
 
 # ===== 克隆并打包 AnyKernel3 =====
@@ -501,7 +475,7 @@ if [[ "$APPLY_LZ4KD" == "y" || "$APPLY_LZ4KD" == "Y" ]]; then
   wget https://raw.githubusercontent.com/cctv18/oppo_oplus_realme_sm8850/refs/heads/main/zram.zip
 fi
 
-if [[ "$USE_PATCH_LINUX" == [kK] ]]; then
+if [[ "$USE_PATCH_LINUX" == [yY] ]]; then
   wget https://github.com/cctv18/KPatch-Next/releases/latest/download/kpn.zip
 fi
 
@@ -517,11 +491,14 @@ fi
 if [[ "$APPLY_LZ4" == "y" || "$APPLY_LZ4" == "Y" ]]; then
   ZIP_NAME="${ZIP_NAME}-lz4-zstd"
 fi
-if [[ "$USE_PATCH_LINUX" == [bBkK] ]]; then
+if [[ "$USE_PATCH_LINUX" == [yY] ]]; then
   ZIP_NAME="${ZIP_NAME}-kpm"
 fi
 if [[ "$APPLY_BBR" == "y" || "$APPLY_BBR" == "Y" ]]; then
   ZIP_NAME="${ZIP_NAME}-bbr"
+fi
+if [[ "$APPLY_DROIDSPACES" == [sSeE] ]]; then
+  ZIP_NAME="${ZIP_NAME}-dss"
 fi
 if [[ "$APPLY_ADIOS" == "y" || "$APPLY_ADIOS" == "Y" ]]; then
   ZIP_NAME="${ZIP_NAME}-adios"

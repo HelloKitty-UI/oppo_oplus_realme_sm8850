@@ -1,0 +1,183 @@
+name: Xbox手柄振动修复内核 (xbox_ff built-in)
+
+on:
+  workflow_dispatch:
+    inputs:
+      enable_modules:
+        description: '允许加载内核模块（去除 modules_disabled 锁）'
+        required: true
+        type: boolean
+        default: true
+      ksu_type:
+        description: 'KernelSU 分支 (默认无KSU，仅编译纯净内核)'
+        required: true
+        type: choice
+        default: 'none'
+        options:
+          - 'none'
+          - 'resukisu'
+          - 'sukisu'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 安装依赖
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq binutils python3 flex bison bc \
+            libssl-dev libelf-dev libdw-dev aria2 zip unzip
+
+      - name: 下载内核源码
+        run: |
+          mkdir -p kernel_workspace
+          cd kernel_workspace
+          aria2c -s16 -x16 -k1M \
+            "https://github.com/cctv18/android_kernel_common_oneplus_sm8850/archive/refs/heads/oneplus/sm8850_v_16.0.0_oneplus_15.zip" \
+            -o common.zip
+          unzip -q common.zip
+          mv android_kernel_common_oneplus_sm8850-* common
+          rm -f common.zip
+          echo "KERNEL_SRC=$(pwd)/common" >> $GITHUB_ENV
+
+      - name: 下载 Clang19 + Rust + build-tools
+        run: |
+          cd kernel_workspace
+          mkdir -p clang19 rust
+          aria2c -s16 -x16 -k1M \
+            "https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang19-r536225/clang-r536225.zip" \
+            -o clang.zip && unzip -q clang.zip -d clang19 && rm -f clang.zip &
+          aria2c -s16 -x16 -k1M \
+            "https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang19-r536225/rust.zip" \
+            -o rust.zip && unzip -q rust.zip -d rust && rm -f rust.zip &
+          aria2c -s16 -x16 -k1M \
+            "https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang19-r536225/build-tools.zip" \
+            -o build-tools.zip && unzip -q build-tools.zip && rm -f build-tools.zip &
+          wait
+
+      - name: Checkout 仓库（获取 xbox_ff.c）
+        uses: actions/checkout@v4
+        with:
+          path: repo
+
+      - name: 注入 xbox_ff.c 到内核（内置编译）
+        run: |
+          cp -v repo/xbox_ff.c kernel_workspace/common/drivers/hid/xbox_ff.c
+          # 作为 built-in 而不是 module
+          echo 'obj-y += xbox_ff.o' >> kernel_workspace/common/drivers/hid/Makefile
+          echo "xbox_ff.c injected as built-in"
+
+      - name: 解除 modules_disabled 限制
+        if: inputs.enable_modules
+        run: |
+          # 使 /proc/sys/kernel/modules_disabled 只读，防止 Android init 锁死模块加载
+          sed -i '/"modules_disabled"/,/},/{
+            s/\.mode[[:space:]]*=[[:space:]]*0644/.mode\t\t= 0444/
+            s/\.mode[[:space:]]*=[[:space:]]*0600/.mode\t\t= 0400/
+          }' kernel_workspace/common/kernel/sysctl.c
+          echo "modules_disabled sysctl made read-only"
+
+      - name: 添加 xbox_ff 的 Kconfig 条目（可选但规范化）
+        run: |
+          cat > kernel_workspace/common/drivers/hid/Kconfig.xbox_ff << 'EOF'
+          config HID_XBOX_FF
+              tristate "Xbox Bluetooth Controller Force Feedback"
+              depends on HID
+              select INPUT_FF_MEMLESS
+              help
+                Adds FF_RUMBLE support for Xbox Wireless Controllers on Bluetooth.
+                Fixes missing vibration on devices like 045E:0B13.
+          EOF
+          # 在 drivers/hid/Kconfig 末尾引用
+          echo 'source "drivers/hid/Kconfig.xbox_ff"' >> kernel_workspace/common/drivers/hid/Kconfig
+
+      - name: 生成内核配置并编译
+        run: |
+          WORKDIR="$(pwd)"
+          export PATH="$WORKDIR/kernel_workspace/clang19/bin:$PATH"
+          export PATH="$WORKDIR/kernel_workspace/build-tools/bin:$PATH"
+          export PATH="$WORKDIR/kernel_workspace/rust/bin:$PATH"
+          cd kernel_workspace/common
+
+          # 6.12 需要 Rust 配置
+          echo "CONFIG_RUST=y" >> arch/arm64/configs/gki_defconfig
+          export RUSTC=rustc BINDGEN=bindgen
+
+          # gki_defconfig + 自定义
+          make -j$(nproc) LLVM=1 ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CC=clang LD=ld.lld O=out gki_defconfig
+
+          scripts/config --file out/.config --enable MODULES
+          scripts/config --file out/.config --enable MODVERSIONS
+          # xbox_ff 是 built-in，但保留 MODULES 以允许其他模块加载
+          scripts/config --file out/.config --enable HID_XBOX_FF
+          scripts/config --file out/.config --enable INPUT_FF_MEMLESS
+
+          make -j$(nproc) LLVM=1 ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CC=clang LD=ld.lld O=out olddefconfig
+
+          make -j$(nproc) LLVM=1 ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CC=clang LD=ld.lld O=out modules_prepare
+
+          # 完整内核构建（Image）
+          make -j$(nproc) LLVM=1 ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm \
+            OBJCOPY=llvm-objcopy O=out Image
+
+      - name: 添加 KernelSU（可选）
+        if: inputs.ksu_type != 'none'
+        run: |
+          cd kernel_workspace
+          if [ "${{ inputs.ksu_type }}" = "resukisu" ]; then
+            curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash -s main
+          elif [ "${{ inputs.ksu_type }}" = "sukisu" ]; then
+            curl -LSs "https://raw.githubusercontent.com/ShirkNeko/SukiSU-Ultra/main/kernel/setup.sh" | bash -s builtin
+          fi
+          echo "CONFIG_KSU=y" >> common/arch/arm64/configs/gki_defconfig
+          # Rebuild with KSU
+          cd common
+          make -j$(nproc) LLVM=1 ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CC=clang LD=ld.lld O=out olddefconfig
+          make -j$(nproc) LLVM=1 ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm \
+            OBJCOPY=llvm-objcopy O=out Image
+
+      - name: 确认 xbox_ff 已编译进内核
+        run: |
+          # 检查 built-in 对象
+          if [ -f "kernel_workspace/common/out/drivers/hid/xbox_ff.o" ]; then
+            echo "xbox_ff.o found (built-in)"
+            strings kernel_workspace/common/out/drivers/hid/xbox_ff.o | grep -c "xbox_ff" || true
+          else
+            echo "WARNING: xbox_ff.o not found!"
+          fi
+          # 确认 FF 符号存在
+          strings kernel_workspace/common/out/vmlinux 2>/dev/null | grep -i "xbox_ff\|FF_RUMBLE enabled" | head -5 || true
+
+      - name: 打包 AnyKernel3
+        run: |
+          cd kernel_workspace
+          git clone --depth=1 https://github.com/cctv18/AnyKernel3
+          rm -rf AnyKernel3/.git
+          cp common/out/arch/arm64/boot/Image AnyKernel3/Image
+          if [ ! -f AnyKernel3/Image ]; then
+            echo "ERROR: Image not found!"; exit 1
+          fi
+          AK3_NAME="xbox-ff-kernel-$(date +%y%m%d%H%M).zip"
+          cd AnyKernel3 && zip -r ../$AK3_NAME ./*
+          mv ../$AK3_NAME ${{ github.workspace }}/
+          echo "AK3_NAME=$AK3_NAME" >> $GITHUB_ENV
+          echo "Package: $AK3_NAME"
+
+      - name: 上传内核包
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.AK3_NAME }}
+          path: ${{ github.workspace }}/*.zip
+

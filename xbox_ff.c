@@ -12,8 +12,10 @@
 #include <linux/device.h>
 #include <linux/hid.h>
 #include <linux/input.h>
+#include <linux/list.h>
 #include <linux/module.h>
 #include <linux/slab.h>
+#include <linux/version.h>
 
 MODULE_AUTHOR("xbox-ff");
 MODULE_DESCRIPTION("Xbox Bluetooth Controller Force Feedback for GKI 6.12");
@@ -94,11 +96,16 @@ static int xbox_ff_probe(struct hid_device *hdev,
 		return ret;
 	}
 
-	idev = hdev->dev_rdesc->application->input;
-	if (!idev) {
-		hid_err(hdev, "xbox_ff: no input device\n");
-		hid_hw_stop(hdev);
-		return -ENODEV;
+	{
+		struct hid_input *hidinput;
+		hidinput = list_first_entry_or_null(&hdev->inputs,
+						     struct hid_input, list);
+		if (!hidinput) {
+			hid_err(hdev, "xbox_ff: no input device\n");
+			hid_hw_stop(hdev);
+			return -ENODEV;
+		}
+		idev = hidinput->input;
 	}
 
 	input_set_drvdata(idev, hdev);
@@ -140,7 +147,6 @@ static int xbox_ff_rebind_existing(void)
 	struct hid_device *hdev;
 	int count = 0;
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 8, 0)
 	hid_for_each_dev(hdev) {
 		if (hid_match_device(hdev, &xbox_ff_driver)) {
 			hid_info(hdev, "xbox_ff: rebinding %s from built-in driver\n",
@@ -150,7 +156,6 @@ static int xbox_ff_rebind_existing(void)
 			count++;
 		}
 	}
-#endif
 	return count;
 }
 

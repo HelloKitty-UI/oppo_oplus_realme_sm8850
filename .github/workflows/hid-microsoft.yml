@@ -20,27 +20,20 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq binutils python3 flex bison bc \
-            libssl-dev libelf-dev libdw-dev aria2 zip unzip \
-            gcc-aarch64-linux-gnu
+            libssl-dev libelf-dev libdw-dev aria2 zip unzip
 
       - name: 下载内核源码
         run: |
           mkdir -p kernel_workspace
           cd kernel_workspace
-          if [ "${{ inputs.kernel_version }}" = "6.12.38" ]; then
-            aria2c -s16 -x16 -k1M \
-              https://github.com/cctv18/android_kernel_common_oneplus_sm8850/archive/refs/heads/oneplus/sm8850_v_16.0.0_oneplus_15.zip \
-              -o common.zip
-          else
-            aria2c -s16 -x16 -k1M \
-              https://github.com/cctv18/android_kernel_common_oneplus_sm8850/archive/refs/heads/oneplus/sm8850_v_16.0.0_oneplus_15.zip \
-              -o common.zip
-          fi
+          aria2c -s16 -x16 -k1M \
+            https://github.com/cctv18/android_kernel_common_oneplus_sm8850/archive/refs/heads/oneplus/sm8850_v_16.0.0_oneplus_15.zip \
+            -o common.zip
           unzip -q common.zip
           mv android_kernel_common_oneplus_sm8850-* common
           rm -f common.zip
 
-      - name: 下载 Clang 19 工具链
+      - name: 下载 Clang 19 + Rust + build-tools
         run: |
           cd kernel_workspace
           mkdir -p clang19
@@ -49,27 +42,58 @@ jobs:
             -o clang.zip
           unzip -q clang.zip -d clang19
           rm -f clang.zip
+          mkdir -p rust
+          aria2c -s16 -x16 -k1M \
+            https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang19-r536225/rust.zip \
+            -o rust.zip
+          unzip -q rust.zip -d rust
+          rm -f rust.zip
+          aria2c -s16 -x16 -k1M \
+            https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang19-r536225/build-tools.zip \
+            -o build-tools.zip
+          unzip -q build-tools.zip
+          rm -f build-tools.zip
 
       - name: Checkout 模块源码
         uses: actions/checkout@v4
         with:
           path: module_src
 
-      - name: 准备内核编译环境
+      - name: 注入 xbox_ff.c 到内核树
+        run: |
+          # Copy module source into kernel source tree
+          cp -v module_src/xbox_ff.c kernel_workspace/common/drivers/hid/
+          # Add to the HID Makefile so it gets compiled as part of the kernel
+          echo 'obj-$(CONFIG_HID_MICROSOFT) += xbox_ff.o' >> kernel_workspace/common/drivers/hid/Makefile
+          echo "Module source injected into kernel tree"
+
+      - name: 配置内核并编译
+        env:
+          FAKESTAT: "2025-05-25 12:00:00"
+          FAKETIME: "@2025-05-25 13:00:00"
         run: |
           WORKDIR="$(pwd)"
           export PATH="$WORKDIR/kernel_workspace/clang19/bin:$PATH"
+          export PATH="$WORKDIR/kernel_workspace/build-tools/bin:$PATH"
+          export PATH="$WORKDIR/kernel_workspace/rust/bin:$PATH"
           cd kernel_workspace/common
 
-          # 6.12 needs Rust config
+          # Setup Rust for 6.12
           echo "CONFIG_RUST=y" >> arch/arm64/configs/gki_defconfig
+          export RUSTC="rustc"
+          export BINDGEN="bindgen"
 
+          # Generate config and build
           make -j$(nproc) LLVM=1 ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-gnu- \
-            CC=clang LD=ld.lld O=out gki_defconfig
+            CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm \
+            OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump \
+            O=out gki_defconfig
 
-          # Disable Rust for our C-only module build
-          scripts/config --file out/.config --disable RUST
+          # Enable module build
+          scripts/config --file out/.config --enable MODULES
+          scripts/config --file out/.config --enable MODVERSIONS
+          scripts/config --file out/.config --disable MODULE_SIG
           make -j$(nproc) LLVM=1 ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-gnu- \
             CC=clang LD=ld.lld O=out olddefconfig
@@ -78,51 +102,35 @@ jobs:
             CROSS_COMPILE=aarch64-linux-gnu- \
             CC=clang LD=ld.lld O=out modules_prepare
 
-      - name: 构建 vmlinux 生成符号表
-        run: |
-          WORKDIR="$(pwd)"
-          export PATH="$WORKDIR/kernel_workspace/clang19/bin:$PATH"
-          cd kernel_workspace/common
-
-          # Build vmlinux to generate Module.symvers / vmlinux.symvers
-          # (required for modpost symbol resolution)
+          # Build vmlinux first (generates symbols), then modules
           make -j$(nproc) LLVM=1 ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-gnu- \
-            CC=clang LD=ld.lld OBJCOPY=llvm-objcopy O=out vmlinux
+            CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm \
+            OBJCOPY=llvm-objcopy O=out vmlinux
 
-      - name: 编译 xbox_ff.ko
-        run: |
-          WORKDIR="$(pwd)"
-          export PATH="$WORKDIR/kernel_workspace/clang19/bin:$PATH"
-
-          MODULE_DIR="$WORKDIR/module_build"
-          mkdir -p "$MODULE_DIR"
-
-          cp "$WORKDIR/module_src/xbox_ff.c" "$MODULE_DIR/"
-
-          cat > "$MODULE_DIR/Makefile" << 'MAKEFILE_END'
-          obj-m := xbox_ff.o
-          MAKEFILE_END
-
-          cd kernel_workspace/common
+          # Now build modules (our xbox_ff.o is included)
           make -j$(nproc) LLVM=1 ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-gnu- \
-            CC=clang LD=ld.lld O=out \
-            M="$MODULE_DIR" KBUILD_MODPOST_WARN=1 modules
+            CC=clang LD=ld.lld O=out modules
 
-      - name: 检查模块
+      - name: 提取 xbox_ff.ko
         run: |
-          ls -lh module_build/xbox_ff.ko
-          echo "=== modinfo ==="
-          modinfo module_build/xbox_ff.ko 2>/dev/null || true
-          echo "=== ELF info ==="
-          readelf -h module_build/xbox_ff.ko 2>/dev/null | head -5 || true
-          echo "=== vermagic ==="
-          strings module_build/xbox_ff.ko | grep vermagic || true
-          echo "=== Build complete ==="
+          KO_FILE="kernel_workspace/common/out/drivers/hid/xbox_ff.ko"
+          if [ -f "$KO_FILE" ]; then
+            ls -lh "$KO_FILE"
+            modinfo "$KO_FILE" 2>/dev/null || true
+            strings "$KO_FILE" | grep vermagic || true
+            mkdir -p artifact
+            cp "$KO_FILE" artifact/
+            echo "xbox_ff.ko found and ready"
+          else
+            echo "ERROR: xbox_ff.ko not found!"
+            find kernel_workspace/common/out -name "xbox_ff*" 2>/dev/null || true
+            exit 1
+          fi
 
       - name: 上传 xbox_ff.ko
         uses: actions/upload-artifact@v4
         with:
           name: xbox_ff_${{ inputs.kernel_version }}
-          path: module_build/xbox_ff.ko
+          path: artifact/xbox_ff.ko

@@ -63,8 +63,8 @@ jobs:
         run: |
           # Copy module source into kernel source tree
           cp -v module_src/xbox_ff.c kernel_workspace/common/drivers/hid/
-          # Add to the HID Makefile so it gets compiled as part of the kernel
-          echo 'obj-$(CONFIG_HID_MICROSOFT) += xbox_ff.o' >> kernel_workspace/common/drivers/hid/Makefile
+          # Add to the HID Makefile (obj-m always builds as module)
+          echo 'obj-m += xbox_ff.o' >> kernel_workspace/common/drivers/hid/Makefile
           echo "Module source injected into kernel tree"
 
       - name: 配置内核并编译
